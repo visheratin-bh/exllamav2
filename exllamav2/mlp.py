@@ -1,10 +1,17 @@
 import torch
 import torch.nn.functional as F
+from torch import nn
 from exllamav2.module import ExLlamaV2Module
 from exllamav2.rmsnorm import ExLlamaV2RMSNorm
 from exllamav2.linear import ExLlamaV2Linear
 from exllamav2.ext import exllamav2_ext as ext_c, none_tensor
 from exllamav2 import ext
+
+# catch_key = None
+# def set_catch(key):
+#     global catch_key
+#     catch_key = key
+
 
 class ExLlamaV2MLP(ExLlamaV2Module):
 
@@ -40,12 +47,29 @@ class ExLlamaV2MLP(ExLlamaV2Module):
                            self.down_proj]
 
 
+    def numel(self):
+
+        return self.gate_proj.numel() + \
+               self.up_proj.numel() + \
+               self.down_proj.numel()
+
+
     def load(self):
 
         self.post_attention_layernorm.load()
-        self.gate_proj.load()
-        self.up_proj.load()
-        self.down_proj.load()
+
+        if self.model.config.checkpoint_fused_mlp:
+            w12 = self.load_weight(self.key + ".mlp.swiglu.w12")
+            w1 = nn.Parameter(w12[:self.model.config.intermediate_size, :].contiguous())
+            w2 = nn.Parameter(w12[self.model.config.intermediate_size:, :].contiguous())
+            w3 = self.load_weight(self.key + ".mlp.swiglu.w3")
+            self.gate_proj.load(w1)
+            self.up_proj.load(w2)
+            self.down_proj.load(w3)
+        else:
+            self.gate_proj.load()
+            self.up_proj.load()
+            self.down_proj.load()
 
         if self.gate_proj.is_quant():
             assert self.up_proj.is_quant() and self.down_proj.is_quant(), "Partially quantized MLP layer"
@@ -76,10 +100,14 @@ class ExLlamaV2MLP(ExLlamaV2Module):
 
     def weight_footprint(self):
 
-        return self.post_attention_layernorm.weight_footprint() + \
-               self.gate_proj.weight_footprint() + \
-               self.up_proj.weight_footprint() + \
-               self.down_proj.weight_footprint()
+        if self.model.config.checkpoint_fused_mlp:
+            return self.post_attention_layernorm.weight_footprint() + \
+                   3 * self.model.config.intermediate_size * self.model.config.hidden_size * 2
+        else:
+            return self.post_attention_layernorm.weight_footprint() + \
+                   self.gate_proj.weight_footprint() + \
+                   self.up_proj.weight_footprint() + \
+                   self.down_proj.weight_footprint()
 
 
     def scratch_space_fixed(self):
@@ -129,10 +157,15 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         self.up_proj.set_device_idx(idx)
         self.down_proj.set_device_idx(idx)
 
-    def forward(self, hidden_states, cache = None, attn_mask = None, past_len = None, intermediates = False, loras = None, position_offsets = None):
+
+    def forward(self, hidden_states, cache = None, attn_params = None, past_len = None, intermediates = False, loras = None):
+        # global catch_key
+        #
+        # if self.key == catch_key:
+        #     return self.forward_torch(hidden_states, cache, attn_params, intermediates, loras = loras)
 
         if self.q_handle is None or intermediates:
-            return self.forward_torch(hidden_states, cache, attn_mask, intermediates, loras = loras)
+            return self.forward_torch(hidden_states, cache, attn_params, intermediates, loras = loras)
 
         if loras is None or self.temp_lora_size == 0:
             pass_loras = []
@@ -149,7 +182,7 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         return hidden_states
 
 
-    def forward_torch(self, hidden_states, cache = None, attn_mask = None, intermediates = False, loras = None, position_offsets = None):
+    def forward_torch(self, hidden_states, cache = None, attn_params = None, intermediates = False, loras = None, position_offsets = None):
 
         residual = hidden_states
         post_norm = self.post_attention_layernorm.forward(hidden_states)
@@ -158,8 +191,9 @@ class ExLlamaV2MLP(ExLlamaV2Module):
         y = F.silu(gate)
         up = self.up_proj.forward(post_norm, loras = loras)
         y *= up
-        down = self.down_proj.forward(y, loras = loras)
+        y.clamp_(min = -65504.0, max = 65504.0)
 
+        down = self.down_proj.forward(y, loras = loras)
         hidden_states = down + residual
 
         if intermediates:

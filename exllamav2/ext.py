@@ -10,9 +10,13 @@ ext_debug = False
 
 windows = (os.name == "nt")
 
+build_jit = False
 try:
     import exllamav2_ext
 except ModuleNotFoundError:
+    build_jit = True
+
+if build_jit:
     # Kludge to get compilation working on Windows
 
     if windows:
@@ -114,12 +118,22 @@ except ModuleNotFoundError:
         "cuda/rms_norm.cu",
         "cuda/rope.cu",
         "cuda/cache.cu",
+        "cuda/util.cu",
+        "cuda/comp_units/kernel_select.cu",
+        "cuda/comp_units/unit_gptq_1.cu",
+        "cuda/comp_units/unit_gptq_2.cu",
+        "cuda/comp_units/unit_gptq_3.cu",
+        "cuda/comp_units/unit_exl2_1a.cu",
+        "cuda/comp_units/unit_exl2_1b.cu",
+        "cuda/comp_units/unit_exl2_2a.cu",
+        "cuda/comp_units/unit_exl2_2b.cu",
+        "cuda/comp_units/unit_exl2_3a.cu",
+        "cuda/comp_units/unit_exl2_3b.cu",
         "cpp/quantize_func.cpp",
         "cpp/sampling.cpp"
     ]
 
     sources = [os.path.join(sources_dir, s) for s in sources_]
-
 
     # Load extension
 

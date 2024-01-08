@@ -212,7 +212,7 @@ class AdaptiveGPTQ:
 
             self.num_batches += 1
             num_samples = len(inputs)
-            inputs = torch.cat(inputs, dim = 0)
+            # inputs = torch.cat(inputs, dim = 0)
             inputs = inputs.view((-1, inputs.shape[-1])).float().T.to("cuda:0")
             inputs *= math.sqrt(2 / num_samples)
             self.hessian += inputs.matmul(inputs.T)
@@ -296,7 +296,10 @@ class AdaptiveGPTQ:
 
                     break
 
-                except RuntimeError:
+                except RuntimeError as runtime_error:
+
+                    if "out of memory" in str(runtime_error):
+                        raise runtime_error
 
                     # If inverting failed, assume there were non-positive eigenvalues, so apply more damping to shift
                     # the eigenvalues in a positive direction.

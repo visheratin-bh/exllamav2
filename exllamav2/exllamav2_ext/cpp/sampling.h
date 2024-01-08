@@ -13,6 +13,8 @@ void apply_rep_penalty_cpu
     const float penalty_max,
     const int sustain,
     const int decay,
+    const float alpha_frequency,
+    const float alpha_presence,
     const int seq_len,
     float* logits
 );
@@ -61,6 +63,14 @@ int top_p_cpu
     float* temp_probs,
     int* temp_indices,
     float top_p
+);
+
+int top_a_cpu
+(
+    const int num_candidates,
+    float* temp_probs,
+    int* temp_indices,
+    float top_a
 );
 
 int min_p_cpu

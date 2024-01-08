@@ -104,10 +104,13 @@ async def infer(request, ws, server, response):
                 stream_full: bool,                  # return full response-so-far with each streamed chunk
                 top_p: float,                       # (optional) top-P threshold (0 to disable)
                 top_k: int,                         # (optional) top-K count (0 to disable)
+                top_a: float,                       # (optional) top-A threshold (0 to disable)
                 min_p: float,                       # (optional) min-P threshold (0 to disable)
                 typical: float,                     # (optional) typical threshold (0 to disable)
                 temperature: float,                 # (optional) sampling temperature (1.0 = no temp adjust)
                 rep_pen: float,                     # (optional) repetition penalty (1.0 = no penalty)
+                freq_pen: float,                    # (optional) frequency penalty (0.0 = no penalty)
+                pres_pen: float,                    # (optional) presence penalty (0.0 = no penalty)
                 stop_conditions: [str|int],         # (optional) list of stop conditions
                 token_healing: bool,                # (optionsl) enable token healing
                 tag: str }                          # (optional) tag to echo in response packet
@@ -142,6 +145,12 @@ async def infer(request, ws, server, response):
         if not isinstance(ss, list): ss = [ss]
         sc += ss
 
+    if "bann_bann" in request:
+        bb = request["bann_bann"]
+        if not isinstance(bb, list): bb = [bb]
+    else:
+        bb = None
+
     # Full response
 
     full_response = request['stream_full'] if 'stream_full' in request else False
@@ -163,10 +172,14 @@ async def infer(request, ws, server, response):
     gs = ExLlamaV2Sampler.Settings()
     gs.top_k = int(request["top_k"]) if "top_k" in request else 100
     gs.top_p = float(request["top_p"]) if "top_p" in request else 0.8
+    gs.top_a = float(request["top_a"]) if "top_a" in request else 0
     gs.min_p = float(request["min_p"]) if "min_p" in request else 0
     gs.typical = float(request["typical"]) if "typical" in request else 0
     gs.temperature = float(request["temperature"]) if "temperature" in request else 0.9
     gs.token_repetition_penalty = float(request["rep_pen"]) if "rep_pen" in request else 1.05
+    gs.token_frequency_penalty = float(request["freq_pen"]) if "freq_pen" in request else 0.0
+    gs.token_presence_penalty = float(request["pres_pen"]) if "pres_pen" in request else 0.0
+    gs.disallow_tokens(server.tokenizer, bb)
 
     # Generate
 
