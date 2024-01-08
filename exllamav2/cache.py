@@ -54,9 +54,10 @@ class ExLlamaV2CacheBase:
         else:
 
             for i in range(self.num_hidden_layers):
-
-                self.key_states.append(None)
-                self.value_states.append(None)
+                p_key_states = torch.zeros(self.batch_size, 0, self.num_key_value_heads, self.head_dim, dtype = self.dtype, device = self.model.cache_map[i]).contiguous()
+                p_value_states = torch.zeros(self.batch_size, 0, self.num_key_value_heads, self.head_dim, dtype = self.dtype, device = self.model.cache_map[i]).contiguous()
+                self.key_states.append(p_key_states)
+                self.value_states.append(p_value_states)
 
 
     def update_cache_tensors(self):
@@ -134,7 +135,9 @@ class ExLlamaV2Cache(ExLlamaV2CacheBase):
 
 
     def get_kv_state(self, layer_idx: int, batch_size: int, offset: int, width: int) -> (torch.Tensor, torch.Tensor):
-        return self.key_states[layer_idx], self.value_states[layer_idx]
+        key_states = self.key_states[layer_idx][:batch_size]
+        value_states = self.value_states[layer_idx][:batch_size]
+        return key_states, value_states
 
 
     def store_kv_state(self, layer_idx: int, batch_size: int, offset: int, width: int):

@@ -12,6 +12,8 @@ import random
 
 import torch.nn.functional as F
 
+from typing import Union, List, Tuple
+
 class ExLlamaV2BaseGenerator:
 
     # Internal state
@@ -52,7 +54,8 @@ class ExLlamaV2BaseGenerator:
                         encode_special_tokens = False,
                         decode_special_tokens = False,
                         loras = None,
-                        stop_token = -1):
+                        stop_token = -1,
+                        return_scores = False) -> Union[str, List[str], Tuple[str, torch.tensor], Tuple[List[str], torch.tensor]]:
 
         # Default stop token
 
@@ -103,10 +106,13 @@ class ExLlamaV2BaseGenerator:
 
         batch_eos = [False] * batch_size
 
-        for i in range(num_tokens):
+        if return_scores:
+            probs = torch.empty((batch_size, 0), device = "cpu", dtype = torch.float)
+
+        for _ in range(num_tokens):
 
             logits = self.model.forward(self.sequence_ids[:, -1:], self.cache, input_mask = mask, loras = loras, position_offsets = position_offsets).float().cpu()
-            token, _, _ = ExLlamaV2Sampler.sample(logits, gen_settings, self.sequence_ids, random.random(), self.tokenizer, prefix_token = unhealed_token)
+            token, prob, _ = ExLlamaV2Sampler.sample(logits, gen_settings, self.sequence_ids, random.random(), self.tokenizer, prefix_token = unhealed_token)
 
             eos = False
             if stop_token is not None:
@@ -116,6 +122,10 @@ class ExLlamaV2BaseGenerator:
                         if all(batch_eos): eos = True
                     if batch_eos[b]:
                         token[b, 0] = self.tokenizer.pad_token_id
+                        prob[b, 0] = -1.0
+            
+            if return_scores:
+                probs = torch.cat([probs, prob], dim=1)
 
             self.sequence_ids = torch.cat([self.sequence_ids, token], dim = 1)
             gen_settings.feed_filters(token)
@@ -127,13 +137,21 @@ class ExLlamaV2BaseGenerator:
 
         text = self.tokenizer.decode(self.sequence_ids, decode_special_tokens = decode_special_tokens)
 
-        if isinstance(prompt, str): return text[0]
-        return text
+        if isinstance(prompt, str): 
+            if return_scores: 
+                return text[0], probs[0]
+            else: 
+                return text[0]
+        if return_scores: 
+            return text, probs
+        else: 
+            return text
 
 
     def _gen_begin_base(self, input_ids, mask = None, loras = None, position_offsets = None):
 
-        self.cache.current_seq_len = 0
+        if self.cache is not None:
+            self.cache.current_seq_len = 0
         self.model.forward(input_ids[:, :-1], self.cache, input_mask = mask, preprocess_only = True, loras = loras, position_offsets = position_offsets)
 
         self.sequence_ids = input_ids.clone()

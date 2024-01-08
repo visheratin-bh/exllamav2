@@ -123,6 +123,9 @@ class ExLlamaV2Tokenizer:
         pad_test = self.tokenizer.piece_to_id("<pad>")
         self.pad_token_id = pad_test or self.eos_token_id
 
+        # Set default padding side
+        self.padding_side = "left"
+
         # Special case if <unk> and <pad> have the same ID
 
         if self.unk_token_id == self.pad_token_id:
@@ -240,7 +243,12 @@ class ExLlamaV2Tokenizer:
                 padding_length = max_length - len(ids)
                 padding = torch.full((padding_length,), self.pad_token_id)
                 padded_ids.append(torch.cat((padding, torch.tensor(ids)), dim = 0))
-                offsets.append(-padding_length)
+                if self.padding_side == "left":
+                    offsets.append(-padding_length)
+                elif self.padding_side == "right":
+                    offsets.append(padding_length)
+                else:
+                    raise ValueError("Invalid padding side: " + self.padding_side)
 
             stacked_ids = torch.stack(padded_ids, dim=0)
 

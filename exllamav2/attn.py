@@ -207,8 +207,6 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
 
     def temp_attn_size(self):
-        global has_flash_attn
-
         att_max = min(self.model.config.max_attention_size, self.model.config.max_seq_len ** 2)
 
         if has_flash_attn and not self.model.config.no_flash_attn:
@@ -239,8 +237,6 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
 
     def forward(self, hidden_states, cache = None, attn_mask = None, past_len = None, intermediates = False, loras = None, position_offsets = None):
-        global has_flash_attn
-
         qkv_embed = self.model.config.qkv_embed and self.layer_idx == 0
 
         if self.q_handle is None or intermediates:
@@ -397,7 +393,6 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             # Flash Attention 2
 
             else:
-
                 attn_output = flash_attn_func(q_states, k_states, v_states, causal = True)
                 attn_output = attn_output.reshape((batch_size, q_len, hidden_size))
 
