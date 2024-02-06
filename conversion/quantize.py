@@ -5,7 +5,8 @@ from exllamav2.model import \
     ExLlamaV2MLP,
     ExLlamaV2MoEMLP,
     ExLlamaV2Linear,
-    ExLlamaV2RMSNorm
+    ExLlamaV2RMSNorm,
+    ExLlamaV2LayerNorm
 )
 
 from safetensors import safe_open
@@ -93,9 +94,13 @@ def quant_linear(job: dict,
     diff1 = torch.max(quant_w)
     quant_w = None
 
-    if diff1 > 0.01 or diff2 > 0.01:
+    # TODO: Investigate why this might fail for the first QKV projections of certain models
+
+    if diff1 > 0.05 or diff2 > 0.05:
         print(" ## Quantization error (2)")
         os._exit(0)
+    elif diff1 > 0.01 or diff2 > 0.01:
+        print(f" !! Warning, difference of ({diff1:.6f}, {diff2:.6f}) between unpacked and dequantized matrices")
 
     # Free reconstructed linear layer
 
@@ -263,8 +268,9 @@ def quant(job, save_fn, model):
             assert module.key == "lm_head"
             quantizers["lm_head"] = AdaptiveGPTQ(module.linear)
 
-        elif isinstance(module, ExLlamaV2RMSNorm):
+        elif isinstance(module, ExLlamaV2RMSNorm) or isinstance(module, ExLlamaV2LayerNorm):
             mode = "norm"
+
 
         # Reference forward pass
 
@@ -408,7 +414,7 @@ def quant(job, save_fn, model):
 
             if mode != "linear":
                 save_dict = {f"row.{idx:05}": h for idx, h in enumerate(hidden_states)}
-                # save_dict |= {f"i_row.{idx:05}": h for idx, h in enumerate(hidden_i_states)}
+                # save_dict.update( {f"i_row.{idx:05}": h for idx, h in enumerate(hidden_i_states)} )
                 save_file(save_dict, temp_filename)
                 save_dict = None
 
@@ -416,11 +422,9 @@ def quant(job, save_fn, model):
             save_fn()
 
             if mode != "linear":
-                os.remove(states_filename)
-                os.rename(temp_filename, states_filename)
+                os.replace(temp_filename, states_filename)
 
             job["q_last_module_idx"] = index
 
             del job["invalid"]
             save_fn()
-

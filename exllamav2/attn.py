@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from exllamav2.module import ExLlamaV2Module
 from exllamav2.rmsnorm import ExLlamaV2RMSNorm
+from exllamav2.layernorm import ExLlamaV2LayerNorm
 from exllamav2.linear import ExLlamaV2Linear
 from exllamav2.cache import ExLlamaV2CacheBase
 from exllamav2.embedding import ExLlamaV2Embedding
@@ -30,7 +31,7 @@ except ModuleNotFoundError:
 class ExLlamaV2Attention(ExLlamaV2Module):
 
     layer_idx: int
-    input_layernorm: ExLlamaV2RMSNorm or None
+    input_layernorm: ExLlamaV2RMSNorm or ExLlamaV2LayerNorm or None
     q_proj: ExLlamaV2Linear or None
     k_proj: ExLlamaV2Linear or None
     v_proj: ExLlamaV2Linear or None
@@ -157,7 +158,11 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         hidden_size = self.model.config.hidden_size
 
-        self.input_layernorm = ExLlamaV2RMSNorm(model, key + ".input_layernorm")
+        if self.model.config.architecture == "Orion":
+            self.input_layernorm = ExLlamaV2LayerNorm(model, key + ".input_layernorm")
+        else:
+            self.input_layernorm = ExLlamaV2RMSNorm(model, key + ".input_layernorm")
+
         self.q_proj = ExLlamaV2Linear(model, key + ".self_attn.q_proj", hidden_size, self.model.config.num_attention_heads * self.model.config.head_dim, False)
         self.k_proj = ExLlamaV2Linear(model, key + ".self_attn.k_proj", hidden_size, self.model.config.num_key_value_heads * self.model.config.head_dim, False)
         self.v_proj = ExLlamaV2Linear(model, key + ".self_attn.v_proj", hidden_size, self.model.config.num_key_value_heads * self.model.config.head_dim, False)
@@ -200,6 +205,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
             # self.temp_kv = device_tensors.get_scratch_slice(self.temp_kv_size()) if self.model.config.num_attention_heads != self.model.config.num_key_value_heads else None
 
             self.q_handle = ext_c.make_q_attn(self.input_layernorm.weight,
+                                              self.input_layernorm.bias if self.input_layernorm.bias is not None else ext.none_tensor,
+                                              isinstance(self.input_layernorm, ExLlamaV2RMSNorm),
                                               self.input_layernorm.variance_epsilon,
                                               self.q_proj.q_handle,
                                               self.k_proj.q_handle,
@@ -428,8 +435,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
                     # Key/value tensors with past
 
-                    k_states = batch_keys.narrow(1, 0, past_len + q_len)
-                    v_states = batch_values.narrow(1, 0, past_len + q_len)
+                    k_states = batch_keys.narrow(0, 0, batch_size).narrow(1, 0, past_len + q_len)
+                    v_states = batch_values.narrow(0, 0, batch_size).narrow(1, 0, past_len + q_len)
 
             # Torch matmul attention
 
@@ -588,17 +595,17 @@ class ExLlamaV2Attention(ExLlamaV2Module):
         key_states_im = self.k_proj.forward(post_norm, loras = loras)
         value_states_im = self.v_proj.forward(post_norm, loras = loras)
 
-        if intermediates:
+        # if intermediates:
+        #
+        #     query_states = query_states_im.clone()
+        #     key_states = key_states_im.clone()
+        #     value_states = value_states_im.clone()
+        #
+        # else:
 
-            query_states = query_states_im.clone()
-            key_states = key_states_im.clone()
-            value_states = value_states_im.clone()
-
-        else:
-
-            query_states = query_states_im
-            key_states = key_states_im
-            value_states = value_states_im
+        query_states = query_states_im
+        key_states = key_states_im
+        value_states = value_states_im
 
         # Apply position embeddings
 
@@ -677,11 +684,11 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
         if intermediates:
             return {"post_norm": post_norm,
-                    "query_states": query_states_im,
-                    "key_states": key_states_im,
-                    "value_states": value_states_im,
+                    # "query_states": query_states_im,
+                    # "key_states": key_states_im,
+                    # "value_states": value_states_im,
                     "attn_output": attn_output,
-                    "attn_proj": attn_proj,
+                    # "attn_proj": attn_proj,
                     "hidden_states": hidden_states}
         else:
             return hidden_states

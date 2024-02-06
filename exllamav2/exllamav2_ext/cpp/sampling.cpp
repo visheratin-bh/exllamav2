@@ -101,6 +101,7 @@ void softmax_cpu
     const float temperature,
     const float* logits,
     const bool* logits_filter,
+    const float exponent,
     float* output
 )
 {
@@ -108,31 +109,31 @@ void softmax_cpu
     float itemp = 1.0f / temperature;
     float maxl = -1e38;
 
-    #pragma unroll(32)
     for (int i = 0; i < vocab_size; i++)
     {
         if (!logits_filter[i]) continue;
         maxl = fmaxf(logits[i], maxl);
     }
-    maxl *= itemp;
 
-    #pragma unroll(32)
     for (int i = 0; i < vocab_size; i++)
     {
         if (!logits_filter[i]) continue;
-        float e = expf(logits[i] * itemp - maxl);
+        float l = logits[i] - maxl;
+        if (exponent == 2.0f)
+            l *= -l;
+        else if (exponent != 1.0f)
+            l = -powf(fabs(l), exponent);
+        float e = expf(l * itemp);
         output[i] = e;
         esum += e;
     }
+
     float isum = 1.0f / esum;
 
-    #pragma unroll(32)
     for (int i = 0; i < vocab_size; i++)
     {
-        if (logits_filter[i])
-            output[i] *= isum;
-        else
-            output[i] = 0.0f;
+        if (logits_filter[i]) output[i] *= isum;
+        else output[i] = 0.0f;
     }
 
 //    printf("Softmax:");
@@ -141,11 +142,12 @@ void softmax_cpu
 //    {
 //        if (logits_filter[i])
 //        {
-//            printf("%d, %f\n", i, output[i]);
 //            summ += output[i];
+//            if (output[i] < 1e-5) continue;
+//            printf("%d, %f\n", i, output[i]);
 //        }
 //    }
-//    printf("sum: %f\n", summ);
+//    printf("sum: %f\n\n", summ);
 }
 
 int post_softmax_temperature
@@ -153,13 +155,44 @@ int post_softmax_temperature
     const int num_candidates,
     float* temp_probs,
     int* temp_indices,
-    float temperature
+    float temperature,
+    float min_temp = 0,
+    float max_temp = 0.0f,
+    float temp_exponent = 1.0f
 )
 {
+    if (max_temp > min_temp)
+    {
+        // Calculate entropy of the softmax probabilities
+
+        float entropy = 0.0f;
+        for (int i = 0; i < num_candidates; ++i)
+        {
+            float prob = temp_probs[i];
+            if (prob > 0.0f) entropy -= prob * logf(prob);  // Ensure no log(0)
+        }
+
+        // Calculate maximum possible entropy
+
+        float max_entropy = -logf(1.0f / num_candidates);
+
+        // Guard against division by zero
+
+        if (max_entropy == 0.0f) max_entropy = 1.0f;
+
+        // Normalize the entropy
+
+        float normalized_entropy = entropy / max_entropy;
+
+        // Map the normalized entropy to the desired temperature range using the power function
+
+        temperature = min_temp + (max_temp - min_temp) * powf(normalized_entropy, temp_exponent);
+    }
+
 //    printf("---- pre\n");
 //    for (int i = 0; i < num_candidates; ++i)
 //        DBGIF(i, temp_probs[i]);
-
+    
     float psum = 0.0f;
     float itemp = 1.0f / temperature;
     for (int i = 0; i < num_candidates; ++i)
@@ -182,7 +215,6 @@ int post_softmax_temperature
 
     return num_candidates;
 }
-
 
 void normalize_cpu
 (
@@ -709,6 +741,16 @@ int multinomial_cpu
     float random
 )
 {
+//    printf("\n-----------------\n");
+//    int j = 0;
+//    for (int i = 0; i < num_candidates && j < 10; ++i)
+//    {
+//        if (temp_probs[i] < 1e-6) continue;
+//        DBGIF(i, temp_probs[i]);
+//        j++;
+//    }
+//    printf("-----------------\n");
+
     int idx = 0;
     float accum = temp_probs[idx];
 
@@ -725,6 +767,5 @@ int multinomial_cpu
 
     return 1;
 }
-
 
 

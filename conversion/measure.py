@@ -5,7 +5,8 @@ from exllamav2.model import \
     ExLlamaV2MLP,
     ExLlamaV2MoEMLP,
     ExLlamaV2Linear,
-    ExLlamaV2RMSNorm
+    ExLlamaV2RMSNorm,
+    ExLlamaV2LayerNorm
 )
 
 from safetensors import safe_open
@@ -17,6 +18,28 @@ from torch import nn
 import os, time, math, json
 import torch.nn.functional as F
 import gc
+
+# graceful exiting
+import signal
+import sys
+
+interrupted = False
+
+def signal_handler(signal, frame):
+    global interrupted
+    if interrupted:
+        print("\nGracefully exiting...")
+        sys.exit(0)
+    else:
+        interrupted = True
+        print("\nCTRL-C again to quit or type 'exit'. You can always resume the process at a later time.")
+        user_input = input("\nPress Enter to continue processing or type 'exit' to quit: ").strip().lower()
+        if user_input == 'exit':
+            print("Gracefully exiting...")
+            sys.exit(0)
+        interrupted = False
+
+signal.signal(signal.SIGINT, signal_handler)
 
 def list_live_tensors():
 
@@ -55,7 +78,7 @@ def embeddings(job, save_fn, model, measure = False):
     hidden_state = module.forward(input_ids)
     module.unload()
 
-    embeddings_dict = { f"row.{i:05}": hidden_state[i:i+1, :, :] for i in range(hidden_state.shape[0]) }
+    embeddings_dict = { f"row.{i:05}": hidden_state[i:i+1, :, :].contiguous() for i in range(hidden_state.shape[0]) }
     save_file(embeddings_dict, os.path.join(job["out_dir"], "hidden_states.safetensors"))
 
 
@@ -100,10 +123,10 @@ def test_error(module, hidden_states, target_states, cache, attn_params):
         xtest = module.forward(x, cache, attn_params)
         xtest = xtest[0].float()
         xref = xref[0].float()
-        rfn_sum += torch.linalg.norm(xtest - xref, 'fro') / torch.linalg.norm(xref, 'fro')
+        rfn_sum += (torch.linalg.norm(xtest - xref, 'fro') / torch.linalg.norm(xref, 'fro')).item()
         rfn_count += 1
 
-    return max(1e-6, 1 - (rfn_sum / rfn_count)).item()
+    return max(1e-6, 1 - (rfn_sum / rfn_count))
 
 
 def measure_attn(module, hidden_states, target_states, quantizers, cache, attn_params):
@@ -267,9 +290,34 @@ def measure_moe_mlp(module, hidden_states, target_states, quantizers, cache, att
 
     return results
 
+# helpful status box for insights around conversions
+def get_remaining_time_str(estimated_time_remaining):
+    remaining_minutes = int(estimated_time_remaining // 60)
+    remaining_seconds = int(estimated_time_remaining % 60)
+    return f"{remaining_minutes}min {remaining_seconds}sec"
+
+def format_line(label, box_width):
+    return f"| {label.ljust(box_width - 3)}|"
+
+def print_status_box(*content_lines):
+    max_content_width = max(len(line) for line in content_lines)
+    box_width = max_content_width + 4 
+
+    print('-' * box_width)
+    for line in content_lines:
+        print(format_line(line, box_width))
+    print('-' * box_width)
 
 @torch.inference_mode()
 def measure_quant(job, save_fn, model):
+
+    # vars for status box
+    time_spent_list = []  
+    rolling_window_size = 10 # (increase to average over larger window)
+    completed_steps = 0  
+    accuracy_sum = 0  
+    accuracy_count = 0  
+    overall_rolling_accuracy = 0  
 
     snapshot_interval = 10
     temp_filename = os.path.join(job["out_dir"], "hidden_states_temp.safetensors")
@@ -278,8 +326,20 @@ def measure_quant(job, save_fn, model):
 
     # Quantize
 
+    last_ckpt_layer_name = "None"
+
     if not "last_module_idx" in job:
         job["last_module_idx"] = 0
+    else:
+        i = job["last_module_idx"]
+        if i < len(model.modules):
+            last_ckpt_layer_name = f"{model.modules[i].key} ({model.modules[i].name})"
+            print(f" -- Resuming from layer: {last_ckpt_layer_name}")
+
+    # vars to support status box
+    total_modules = len(model.modules)  
+    last_module_idx = job["last_module_idx"]  # resume tracking steps where it stopped previously
+    remaining_steps = total_modules - last_module_idx  
 
     hidden_states = []
     with safe_open(states_filename, framework = "pt", device = "cpu") as f:
@@ -289,8 +349,24 @@ def measure_quant(job, save_fn, model):
     index = job["last_module_idx"]
     while True:
 
+        # sig handler should catch it faster in most cases
+        if interrupted:
+            print("Measurement process was interrupted. Please decide:")
+            if interrupted:
+                print("Exiting after saving the current state.")
+                job["measurement"] = measurement.copy()
+                job["last_module_idx"] = index
+                save_fn()
+                return "interrupted"
+            else:
+                print("Resuming the process.")
+
         index += 1
         if index >= len(model.modules): break
+
+        # Timer
+
+        begin_time = time.time()
 
         # Prepare module
 
@@ -327,7 +403,7 @@ def measure_quant(job, save_fn, model):
             mode = "linear"
             # Don't measure head layer
 
-        elif isinstance(module, ExLlamaV2RMSNorm):
+        elif isinstance(module, ExLlamaV2RMSNorm) or isinstance(module, ExLlamaV2LayerNorm):
             mode = "norm"
 
         # Reference forward pass
@@ -389,6 +465,16 @@ def measure_quant(job, save_fn, model):
 
         measurement[module.key + "." + mode] = m
 
+        # # track overall accuracy for status box
+        # if m is not None and len(m) > 0:
+        #     layer_accuracies = [result['accuracy'] for result in m]
+        #     layer_accuracy_sum = sum(layer_accuracies)
+        #     layer_accuracy_count = len(layer_accuracies)
+        #
+        #     accuracy_sum += layer_accuracy_sum
+        #     accuracy_count += layer_accuracy_count
+        #     overall_rolling_accuracy = accuracy_sum / accuracy_count
+
         # Unload module
 
         module.unload()
@@ -397,6 +483,40 @@ def measure_quant(job, save_fn, model):
         # Advance
 
         hidden_states = target_states
+
+        # Timing and status box
+
+        end_time = time.time()
+        duration = end_time - begin_time
+
+        time_spent_list.append(duration)
+        if len(time_spent_list) > rolling_window_size:
+            time_spent_list.pop(0)
+        average_time_per_step = sum(time_spent_list) / len(time_spent_list)
+
+        remaining_steps = total_modules - index
+        estimated_time_remaining = average_time_per_step * remaining_steps
+        completed_steps = index
+
+        completed_module_name_str = f"Measured: {module.key} ({module.name})"
+        duration_str = f"Duration: {duration:.2f} seconds"
+        completed_step_str = f"Completed step: {completed_steps}/{total_modules}"
+        avg_time_str = f"Avg time / step (rolling): {average_time_per_step:.2f} seconds"
+        remaining_time_str = f"Estimated remaining time: {get_remaining_time_str(estimated_time_remaining)}"
+        # overall_accuracy_str = f"Overall avg accuracy: {overall_rolling_accuracy:.8f}" if accuracy_count > 0 else ""
+        last_ckpt_str = f"Last checkpoint layer: {last_ckpt_layer_name}"
+
+        content_lines = [completed_module_name_str,
+                         duration_str,
+                         completed_step_str,
+                         avg_time_str,
+                         remaining_time_str,
+                         last_ckpt_str]
+
+        # if accuracy_count > 0:
+        #     content_lines.append(overall_accuracy_str)
+
+        print_status_box(*content_lines)
 
         # Checkpoint
 
@@ -409,11 +529,12 @@ def measure_quant(job, save_fn, model):
             job["invalid"] = True
             save_fn()
 
-            os.remove(states_filename)
-            os.rename(temp_filename, states_filename)
+            os.replace(temp_filename, states_filename)
 
             job["measurement"] = measurement.copy()
             job["last_module_idx"] = index
+
+            last_ckpt_layer_name = f"{module.key} ({module.name})"
 
             del job["invalid"]
             save_fn()
@@ -432,4 +553,4 @@ def measure_quant(job, save_fn, model):
         with open(filename, "w", encoding = "utf8") as f:
             f.write(json.dumps(exp_measurement, indent = 4))
 
-
+    return "completed"  # graceful exiting 
