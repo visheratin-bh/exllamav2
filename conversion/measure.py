@@ -6,7 +6,8 @@ from exllamav2.model import \
     ExLlamaV2MoEMLP,
     ExLlamaV2Linear,
     ExLlamaV2RMSNorm,
-    ExLlamaV2LayerNorm
+    ExLlamaV2LayerNorm,
+    ExLlamaV2ParallelDecoder
 )
 
 from safetensors import safe_open
@@ -91,8 +92,9 @@ def test_quant(source: ExLlamaV2Linear,
     variants = []
     variants_bits = []
 
-    original = nn.Linear(source.in_features, source.out_features, False, device = "meta", dtype = torch.float16)
+    original = nn.Linear(source.in_features, source.out_features, source.has_bias, device = "meta", dtype = torch.float16)
     original.weight = nn.Parameter(source.linear.weight.clone())
+    if source.has_bias: original.bias.weight = nn.Parameter(source.linear.bias.clone())
 
     for qp in qparams:
 
@@ -102,10 +104,12 @@ def test_quant(source: ExLlamaV2Linear,
         quantized.to("cpu")
 
         variants.append(quantized)
-        total_bits = qp.total_bits(quantized.weight.T.shape)
+        total_bits = qp.total_bits(quantized.weight.T.shape, original.bias.weight.shape if source.has_bias else None)
         variants_bits.append(total_bits)
 
-        bpw = total_bits / quantized.weight.numel()
+        numel = quantized.weight.numel()
+        if source.has_bias: numel += original.bias.numel()
+        bpw = total_bits / numel
         desc = qp.desc
 
         print(f" -- {source.key:50} {desc:50} {bpw:2.2f} bpw")
@@ -180,47 +184,79 @@ def measure_attn(module, hidden_states, target_states, quantizers, cache, attn_p
     return results
 
 
-def measure_mlp(module, hidden_states, target_states, quantizers, cache, attn_params):
+def measure_mlp(module, hidden_states, target_states, quantizers, cache, attn_params, reuse_h_up_proj = None):
 
-    qjobs, qmaps = get_qparams_reduced(qparams_mlp)
+    has_gate = module.model.config.arch.mlp_gate
+
+    qjobs, qmaps = get_qparams_reduced(qparams_mlp, not has_gate)
     results = []
 
-    quantizers["gate_proj"].prepare()
-    quantizers["up_proj"].reuse_h(quantizers["gate_proj"])
+    if reuse_h_up_proj is not None:
+        quantizers["up_proj"].reuse_h(quantizers[reuse_h_up_proj])
+    else:
+        quantizers["up_proj"].prepare()
+    if has_gate: quantizers["gate_proj"].reuse_h(quantizers["up_proj"])
     quantizers["down_proj"].prepare()
 
-    options_g, bits_g = test_quant(module.gate_proj, quantizers[f"gate_proj"], qjobs[0])
+    options_g, bits_g = test_quant(module.gate_proj, quantizers[f"gate_proj"], qjobs[0]) if has_gate else (None, None)
     options_u, bits_u = test_quant(module.up_proj, quantizers[f"up_proj"], qjobs[1])
     options_d, bits_d = test_quant(module.down_proj, quantizers[f"down_proj"], qjobs[2])
 
-    total_numel = module.gate_proj.numel()
+    total_numel = module.gate_proj.numel() if has_gate else 0
     total_numel += module.up_proj.numel()
     total_numel += module.down_proj.numel()
 
-    (g_, u_, d_) = (-1, -1, -1)
-    for (g, u, d) in qmaps:
+    if has_gate:
 
-        if g != g_: module.gate_proj.linear.weight = nn.Parameter(options_g[g].weight.cuda())
-        if u != u_: module.up_proj.linear.weight = nn.Parameter(options_u[u].weight.cuda())
-        if d != d_: module.down_proj.linear.weight = nn.Parameter(options_d[d].weight.cuda())
-        (g_, u_, d_) = (g, u, d)
+        (g_, u_, d_) = (-1, -1, -1)
+        for (g, u, d) in qmaps:
 
-        total_bits = bits_g[g]
-        total_bits += bits_u[u]
-        total_bits += bits_d[d]
-        total_bpw = total_bits / total_numel
+            if g != g_: module.gate_proj.linear.weight = nn.Parameter(options_g[g].weight.cuda())
+            if u != u_: module.up_proj.linear.weight = nn.Parameter(options_u[u].weight.cuda())
+            if d != d_: module.down_proj.linear.weight = nn.Parameter(options_d[d].weight.cuda())
+            (g_, u_, d_) = (g, u, d)
 
-        accuracy = test_error(module, hidden_states, target_states, cache, attn_params)
-        print(f" -- {total_bpw:1.4f} bpw  accuracy: {accuracy:1.8f}")
+            total_bits = bits_g[g]
+            total_bits += bits_u[u]
+            total_bits += bits_d[d]
+            total_bpw = total_bits / total_numel
 
-        torch.cuda.empty_cache()
+            accuracy = test_error(module, hidden_states, target_states, cache, attn_params)
+            print(f" -- {total_bpw:1.4f} bpw  accuracy: {accuracy:1.8f}")
 
-        r = { "accuracy": accuracy,
-              "total_bits": total_bits,
-              "gate_proj": qjobs[0][g].get_dict(),
-              "up_proj": qjobs[1][u].get_dict(),
-              "down_proj": qjobs[2][d].get_dict() }
-        results.append(r)
+            torch.cuda.empty_cache()
+
+            r = { "accuracy": accuracy,
+                  "total_bits": total_bits,
+                  "gate_proj": qjobs[0][g].get_dict(),
+                  "up_proj": qjobs[1][u].get_dict(),
+                  "down_proj": qjobs[2][d].get_dict() }
+            results.append(r)
+
+    else:
+
+        (u_, d_) = (-1, -1)
+        for (u , d) in qmaps:
+
+            if u != u_: module.up_proj.linear.weight = nn.Parameter(options_u[u].weight.cuda())
+            if d != d_: module.down_proj.linear.weight = nn.Parameter(options_d[d].weight.cuda())
+            (u_, d_) = (u, d)
+
+            total_bits = bits_u[u]
+            total_bits += bits_d[d]
+            total_bpw = total_bits / total_numel
+
+            accuracy = test_error(module, hidden_states, target_states, cache, attn_params)
+            print(f" -- {total_bpw:1.4f} bpw  accuracy: {accuracy:1.8f}")
+
+            torch.cuda.empty_cache()
+
+            r = { "accuracy": accuracy,
+                  "total_bits": total_bits,
+                  "up_proj": qjobs[1][u].get_dict(),
+                  "down_proj": qjobs[2][d].get_dict() }
+            results.append(r)
+
 
     return results
 
@@ -289,6 +325,18 @@ def measure_moe_mlp(module, hidden_states, target_states, quantizers, cache, att
         results.append(r)
 
     return results
+
+
+def measure_parallel_decoder(module, hidden_states, target_states_attn, target_states_mlp, quantizers, cache, attn_params):
+
+    print(f" -- Sublayer: {module.key}.self_attn")
+    results_attn = measure_attn(module.attn, hidden_states, target_states_attn, quantizers, cache, attn_params)
+    print(f" -- Sublayer: {module.key}.mlp")
+    results_mlp = measure_mlp(module.mlp, hidden_states, target_states_mlp, quantizers, cache, attn_params, "q_proj")
+    r = { "attn": results_attn,
+          "mlp": results_mlp }
+    return r
+
 
 # helpful status box for insights around conversions
 def get_remaining_time_str(estimated_time_remaining):
@@ -388,7 +436,8 @@ def measure_quant(job, save_fn, model):
 
         elif isinstance(module, ExLlamaV2MLP):
             mode = "mlp"
-            quantizers["gate_proj"] = AdaptiveGPTQ(module.gate_proj.linear)
+            has_gate = module.model.config.arch.mlp_gate
+            if has_gate: quantizers["gate_proj"] = AdaptiveGPTQ(module.gate_proj.linear)
             quantizers["up_proj"] = AdaptiveGPTQ(module.up_proj.linear)
             quantizers["down_proj"] = AdaptiveGPTQ(module.down_proj.linear)
 
@@ -398,6 +447,17 @@ def measure_quant(job, save_fn, model):
                 quantizers[f"w1.{i}"] = AdaptiveGPTQ(module.w1[i].linear)
                 quantizers[f"w3.{i}"] = AdaptiveGPTQ(module.w3[i].linear)
                 quantizers[f"w2.{i}"] = AdaptiveGPTQ(module.w2[i].linear)
+
+        elif isinstance(module, ExLlamaV2ParallelDecoder):
+            mode = "parallel_decoder"
+            quantizers["q_proj"] = AdaptiveGPTQ(module.attn.q_proj.linear)
+            quantizers["k_proj"] = AdaptiveGPTQ(module.attn.k_proj.linear)
+            quantizers["v_proj"] = AdaptiveGPTQ(module.attn.v_proj.linear)
+            quantizers["o_proj"] = AdaptiveGPTQ(module.attn.o_proj.linear)
+            has_gate = module.model.config.arch.mlp_gate
+            if has_gate: quantizers["gate_proj"] = AdaptiveGPTQ(module.mlp.gate_proj.linear)
+            quantizers["up_proj"] = AdaptiveGPTQ(module.mlp.up_proj.linear)
+            quantizers["down_proj"] = AdaptiveGPTQ(module.mlp.down_proj.linear)
 
         elif isinstance(module, ExLlamaV2Linear):
             mode = "linear"
@@ -409,9 +469,13 @@ def measure_quant(job, save_fn, model):
         # Reference forward pass
 
         cache = None
-        attn_params = ExLlamaV2Attention.Params(1, hidden_states[0].shape[1], 0, None, None) if mode == "self_attn" else None
+        attn_params = ExLlamaV2Attention.Params(1, hidden_states[0].shape[1], 0, None, None) \
+            if mode in ["self_attn", "parallel_decoder"] else None
 
         target_states = []
+        target_states_attn = []
+        target_states_mlp = []
+
         if mode == "block_sparse_moe":
             uncalibrated_experts = [0 for _ in range(model.config.num_experts)]
 
@@ -425,10 +489,12 @@ def measure_quant(job, save_fn, model):
             if mode == "self_attn":
                 quantizers["q_proj"].add_batch(outputs["post_norm"])  # Reuse H for K and V
                 quantizers["o_proj"].add_batch(outputs["attn_output"])
+                target_states.append(outputs["hidden_states"].to("cpu"))
 
             if mode == "mlp":
-                quantizers["gate_proj"].add_batch(outputs["post_norm"])  # Reuse H for up_proj
+                quantizers["up_proj"].add_batch(outputs["post_norm"])  # Reuse H for gate_proj
                 quantizers["down_proj"].add_batch(outputs["pre_down"])
+                target_states.append(outputs["hidden_states"].to("cpu"))
 
             if mode == "block_sparse_moe":
                 for j in range(model.config.num_experts):
@@ -439,8 +505,16 @@ def measure_quant(job, save_fn, model):
                             uncalibrated_experts[j] += 1
                     else:
                         uncalibrated_experts[j] += 1
+                target_states.append(outputs["hidden_states"].to("cpu"))
 
-            target_states.append(outputs["hidden_states"].to("cpu"))
+            if mode == "parallel_decoder":
+                quantizers["q_proj"].add_batch(outputs["post_norm"])  # Reuse H for K, V, up_proj and gate_proj
+                quantizers["o_proj"].add_batch(outputs["attn_output"])
+                quantizers["down_proj"].add_batch(outputs["pre_down"])
+                hidden_states[i] = outputs["post_norm"]
+                target_states_attn.append(outputs["hidden_states_attn"].to("cpu"))
+                target_states_mlp.append(outputs["hidden_states_mlp"].to("cpu"))
+                target_states.append(outputs["hidden_states"].to("cpu"))
 
         # For MoE layers, warn if any layer received less than 10% of a calibration batch
 
@@ -463,6 +537,13 @@ def measure_quant(job, save_fn, model):
         if mode == "block_sparse_moe":
             m = measure_moe_mlp(module, hidden_states, target_states, quantizers, cache, attn_params)
 
+        if mode == "parallel_decoder":
+            m = measure_parallel_decoder(module, hidden_states, target_states_attn, target_states_mlp, quantizers, cache, attn_params)
+            target_states_attn = None
+            target_states_mlp = None
+
+        quantizers = None
+
         measurement[module.key + "." + mode] = m
 
         # # track overall accuracy for status box
@@ -478,6 +559,7 @@ def measure_quant(job, save_fn, model):
         # Unload module
 
         module.unload()
+        gc.collect()
         torch.cuda.empty_cache()
 
         # Advance

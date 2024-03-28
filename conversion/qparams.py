@@ -57,7 +57,7 @@ class QParams:
                        qp_dict["scale_bits"])
 
 
-    def total_bits(self, shape):
+    def total_bits(self, shape, bias_shape = None):
 
         rows = shape[0]
         columns = shape[1]
@@ -91,16 +91,26 @@ class QParams:
         total_bits += groups * columns * self.scale_bits    # q_scale
         total_bits += rows * 32                             # q_invperm
 
+        if bias_shape is not None:
+            bias_numel = 1
+            for d in bias_shape: bias_numel *= d
+            total_bits += 16 * d
+
         return total_bits
 
 
-    def bpw(self, shape):
+    def bpw(self, shape, bias_shape = None):
 
         rows = shape[0]
         columns = shape[1]
         numel = rows * columns
 
-        return self.total_bits(shape) / numel
+        if bias_shape is not None:
+            bias_numel = 1
+            for d in bias_shape: bias_numel *= d
+            numel += d
+
+        return self.total_bits(shape, bias_shape) / numel
 
 
     def get_desc(self, filename = False):
@@ -336,7 +346,7 @@ qparams_headoptions = \
     # 16: None
 }
 
-def get_qparams_reduced(options):
+def get_qparams_reduced(options, ignore_gate = False):
 
     num_options = len(options)
     dim = len(options[0])
@@ -349,6 +359,7 @@ def get_qparams_reduced(options):
     for o in options:
         m = []
         for idx, qp in enumerate(o):
+            if ignore_gate and idx == 0: continue
             desc = qp.get_desc()
             if desc not in desc_to_idx[idx]:
                 j = len(idx_to_qp[idx])

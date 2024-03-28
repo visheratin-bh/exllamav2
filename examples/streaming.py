@@ -19,17 +19,12 @@ import time
 # Initialize model and cache
 
 model_directory = "/mnt/str/models/mistral-7b-instruct-exl2/4.0bpw/"
-
-config = ExLlamaV2Config()
-config.model_dir = model_directory
-config.prepare()
-
-model = ExLlamaV2(config)
 print("Loading model: " + model_directory)
 
+config = ExLlamaV2Config(model_directory)
+model = ExLlamaV2(config)
 cache = ExLlamaV2Cache(model, lazy = True)
 model.load_autosplit(cache)
-
 tokenizer = ExLlamaV2Tokenizer(config)
 
 # Initialize generator
@@ -52,7 +47,7 @@ max_new_tokens = 250
 
 prompt = "Our story begins in the Scottish town of Auchtermuchty, where once"
 
-input_ids = tokenizer.encode(prompt)
+input_ids = tokenizer.encode(prompt, add_bos = True)
 prompt_tokens = input_ids.shape[-1]
 
 # Make sure CUDA is initialized so we can measure performance
@@ -67,7 +62,7 @@ print (prompt, end = "")
 sys.stdout.flush()
 
 generator.set_stop_conditions([])
-generator.begin_stream(input_ids, settings)
+generator.begin_stream_ex(input_ids, settings)
 
 # Streaming loop. Note that repeated calls to sys.stdout.flush() adds some latency, but some
 # consoles won't update partial lines without it.
@@ -76,7 +71,10 @@ time_begin_stream = time.time()
 generated_tokens = 0
 
 while True:
-    chunk, eos, _ = generator.stream()
+    res = generator.stream_ex()
+    chunk = res["chunk"]
+    eos = res["eos"]
+
     generated_tokens += 1
     print (chunk, end = "")
     sys.stdout.flush()

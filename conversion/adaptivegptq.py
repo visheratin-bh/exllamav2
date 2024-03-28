@@ -218,7 +218,7 @@ class AdaptiveGPTQ:
             self.hessian += inputs.matmul(inputs.T)
 
 
-    def prepare(self):
+    def prepare(self, no_h_inv = False):
 
         with torch.inference_mode():
 
@@ -237,7 +237,14 @@ class AdaptiveGPTQ:
 
             self.perm = torch.argsort(diagonal, descending = True)
             self.perm_cpu = self.perm.cpu()
-            self.weights = self.weights[self.perm, :]
+
+            if self.weights.numel() > 1e9:
+                self.weights = self.weights.to("cpu")
+                self.weights = self.weights[self.perm_cpu, :]
+                self.weights = self.weights.to("cuda:0")
+            else:
+                self.weights = self.weights[self.perm, :]
+
             hessian = self.hessian[self.perm][:, self.perm]
             self.hessian = None
 
@@ -256,7 +263,7 @@ class AdaptiveGPTQ:
             # Inverse of H
 
             attempts = 0
-            while True:
+            while not no_h_inv:
 
                 try:
 
@@ -311,7 +318,7 @@ class AdaptiveGPTQ:
                     if attempts == 10:
                         raise ValueError("Hessian is not invertible")
 
-            self.hessian_inv = hessian_inv
+            self.hessian_inv = None if no_h_inv else hessian_inv
             self.hessian = None
 
     def reuse_h(self, other):
@@ -324,8 +331,88 @@ class AdaptiveGPTQ:
             self.perm_cpu = other.perm_cpu
             self.weights = self.weights[self.perm, :]
 
+    def quantize_rtn_inplace(self, keep_qweight = False, apply = False):
+        assert apply and keep_qweight
 
-    def quantize(self, keep_qweight = False, apply = False, drop = False):
+        with torch.inference_mode():
+
+            self.qweight = torch.zeros_like(self.weights, dtype = torch.short)
+
+            num_groups = 0
+            for bits_idx in range(len(self.bits)):
+                num_groups += self.bits_groups[bits_idx]
+
+            scale = []
+            qscale = []
+            qscale_max = torch.empty((num_groups,), dtype = torch.float, device = self.weights.device)
+            qgroups = []
+
+            group_idx = 0
+            group_idx_list = []
+
+            b = 0
+            for bits_idx, bits in enumerate(self.bits):
+                quantizer = AdaptiveQuantizer(bits = bits, scale_bits = self.scale_bits)
+
+                for group in range(self.bits_groups[bits_idx]):
+                    a = b
+                    b = min(a + self.group_size[bits], self.rows)
+
+                    qgroups.append(bits)
+                    qgroups.append(0)
+
+                    quantizer.find_params(self.weights[a : b, :])
+                    scale.append(quantizer.scale)
+                    qscale.append(quantizer.qscale)
+                    qscale_max[group_idx] = quantizer.qscale_max
+
+                    ext_c.quantize_range_inplace(self.weights,
+                                                 quantizer.scale,
+                                                 self.qweight,
+                                                 quantizer.qzero,
+                                                 quantizer.maxq,
+                                                 a,
+                                                 b)
+
+                    group_idx_list += [group_idx] * (b - a)
+                    group_idx += 1
+
+            # Create g_idx to store inverse activation order
+
+            self.invperm = torch.argsort(self.perm)
+
+            # Store scales
+
+            self.scale = torch.stack(scale, dim = 0)
+            self.qscale = torch.stack(qscale, dim = 0)
+            self.qscale_max = qscale_max.to(torch.float16)
+            self.qgroups = torch.tensor(qgroups, dtype = torch.short)
+
+            # I love Python
+
+            scale = None
+            qscale = None
+            qscale_max = None
+            qgroups = None
+            group_idx_list = None
+
+            qc = self.weights.cpu()
+            qc = qc.to(torch.half)
+            invperm = self.invperm.cpu()
+            q = qc[invperm, :].T
+            q = q.reshape(self.weights.T.shape)
+
+            dev = self.weights.device
+            self.weights = None
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            q = q.to(dev)
+            self.layer.weight.data = q
+            self.weights = q.T
+
+
+    def quantize(self, keep_qweight = False, apply = False):
 
         with torch.inference_mode():
 
@@ -385,7 +472,6 @@ class AdaptiveGPTQ:
                     group_idx_list += [group_idx] * (b - a)
                     group_idx += 1
 
-
             # Create g_idx to store inverse activation order
 
             # self.g_idx = torch.tensor(group_idx_list, dtype = torch.int32, device = self.device)
@@ -401,19 +487,19 @@ class AdaptiveGPTQ:
             self.qscale_max = qscale_max.to(torch.float16)
             self.qgroups = torch.tensor(qgroups, dtype = torch.short)
 
+            # I love Python
+
+            weights = None
+            error = None
+            scale = None
+            qscale = None
+            qscale_max = None
+            qgroups = None
+            group_idx_list = None
+
             # Apply
 
             if apply:
-                if drop:
-                    weights = None
-                    error = None
-                    scale = None
-                    qscale = None
-                    qscale_max = None
-                    qgroups = None
-                    group_idx_list = None
-                    gc.collect()
-                    torch.cuda.empty_cache()
                 self.apply_quant()
 
 
@@ -431,10 +517,16 @@ class AdaptiveGPTQ:
 
     def apply_quant(self):
 
+        self.hessian = None
+
         qc = self.quant.cpu()
         invperm = self.invperm.cpu()
         q = qc[invperm, :].T
         q = q.reshape(self.quant.T.shape)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
         q = q.to(self.quant.device)
         self.layer.weight.data = q
 
@@ -459,6 +551,8 @@ class AdaptiveGPTQ:
         output[key + ".q_invperm"] = self.invperm.to(torch.int)
         output[key + ".q_scale_max"] = self.qscale_max
         output[key + ".q_groups"] = self.qgroups
+        if self.layer.bias is not None:
+            output[key + ".bias"] = self.layer.bias.data
 
         columns = self.columns
         rem_rows = self.rows

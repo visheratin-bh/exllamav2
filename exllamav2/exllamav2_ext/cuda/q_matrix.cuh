@@ -37,6 +37,7 @@ public:
     uint16_t* cuda_q_group_map = NULL;
     uint32_t* cuda_gptq_qzeros = NULL;
     half* cuda_gptq_scales = NULL;
+    half* cuda_bias = NULL;
 
     half* temp_dq;
 
@@ -61,6 +62,8 @@ public:
         half* _gptq_scales,
         uint32_t* _gptq_g_idx,
 
+        half* bias,
+
         half* _temp_dq
     );
 
@@ -72,5 +75,35 @@ public:
 private:
 
 };
+
+void matrix_q4_to_fp16_cuda
+(
+    const uint8_t* in_ptr,
+    const half* scales_ptr,
+    half* out_ptr,
+    int numel
+);
+
+void matrix_fp16_to_q4_cuda
+(
+    const half* in_ptr,
+    uint8_t* out_ptr,
+    half* scales_ptr,
+    int numel
+);
+
+void matrix_fp8_to_fp16_cuda
+(
+    const uint8_t* in_ptr,
+    half* out_ptr,
+    int numel
+);
+
+void matrix_fp16_to_fp8_cuda
+(
+    const half* in_ptr,
+    uint8_t* out_ptr,
+    int numel
+);
 
 #endif

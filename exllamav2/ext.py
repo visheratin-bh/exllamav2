@@ -5,10 +5,14 @@ import sys
 import platform
 
 extension_name = "exllamav2_ext"
-verbose = False
-ext_debug = False
+verbose = False  # Print wall of text when compiling
+ext_debug = False  # Compile with debug options
+
+# Determine if we're on Windows
 
 windows = (os.name == "nt")
+
+# Determine if extension is already installed or needs to be built
 
 build_jit = False
 try:
@@ -17,6 +21,7 @@ except ModuleNotFoundError:
     build_jit = True
 
 if build_jit:
+
     # Kludge to get compilation working on Windows
 
     if windows:
@@ -72,19 +77,16 @@ if build_jit:
             else:
                 print(" !! Unable to find cl.exe; compilation will probably fail", file = sys.stderr)
 
-
     # gcc / cl.exe flags
 
-    extra_cflags = ["/Ox"] if windows else ["-O3"]
+    extra_cflags = ["/Ox", "/arch:AVX2"] if windows else ["-O3", "-mavx2"]
 
     if ext_debug:
         extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
 
-
     # nvcc flags
 
     extra_cuda_cflags = ["-lineinfo", "-O3"]
-    # extra_cuda_cflags += ["-maxrregcount=128"]
 
     if torch.version.hip:
         extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]
@@ -98,7 +100,6 @@ if build_jit:
         if sys.base_prefix != sys.prefix:
             extra_ldflags += [f"/LIBPATH:{os.path.join(sys.base_prefix, 'libs')}"]
 
-
     # sources
 
     library_dir = os.path.dirname(os.path.abspath(__file__))
@@ -106,7 +107,18 @@ if build_jit:
 
     sources_ = \
     [
-        "ext.cpp",
+        "ext_bindings.cpp",
+        "ext_cache.cpp",
+        "ext_gemm.cpp",
+        "ext_norm.cpp",
+        "ext_qattn.cpp",
+        "ext_qmatrix.cpp",
+        "ext_qmlp.cpp",
+        "ext_quant.cpp",
+        "ext_rope.cpp",
+        "ext_safetensors.cpp",
+        "ext_sampling.cpp",
+        "cuda/h_add.cu",
         "cuda/h_gemm.cu",
         "cuda/lora.cu",
         "cuda/pack_tensor.cu",
@@ -160,7 +172,7 @@ none_tensor = torch.empty((1, 1), device = "meta")
 
 # Group map needed for irregular group sizes
 
-def make_group_map(q_groups, num_qrows):
+def make_group_map(q_groups: torch.Tensor, num_qrows: int) -> torch.Tensor:
 
     gr = q_groups.tolist()
     group_map = []
@@ -183,13 +195,16 @@ def make_group_map(q_groups, num_qrows):
 
 # Create Q matrix
 
-def make_q_matrix(w: dict, temp_dq, key: str = None):
+def make_q_matrix(w: dict,
+                  temp_dq: torch.Tensor,
+                  key: str = None,
+                  prescale: float = 1):
 
     # EXL2
 
     if "q_weight" in w:
 
-        w["q_scale_max"] /= 256
+        w["q_scale_max"] *= prescale / 256
         w["q_perm"] = w["q_perm"].short()
         w["q_invperm"] = w["q_invperm"].short()
 
@@ -206,12 +221,14 @@ def make_q_matrix(w: dict, temp_dq, key: str = None):
                                    none_tensor,
                                    none_tensor,
                                    none_tensor,
+                                   w.get("bias", none_tensor),
                                    temp_dq)
 
     # GPTQ
 
     elif "qweight" in w:
 
+        if prescale != 1: w["scales"] *= prescale
         if w["scales"].dtype == torch.float: w["scales"] = w["scales"].half()
 
         # GPTQ with g_idx (act_order)
@@ -231,6 +248,7 @@ def make_q_matrix(w: dict, temp_dq, key: str = None):
                                        w["qzeros"],
                                        w["scales"],
                                        w["g_idx"].cpu(),
+                                       w.get("bias", none_tensor),
                                        temp_dq)
 
         # GPTQ without g_idx
@@ -247,6 +265,7 @@ def make_q_matrix(w: dict, temp_dq, key: str = None):
                                        w["qzeros"],
                                        w["scales"],
                                        none_tensor,
+                                       w.get("bias", none_tensor),
                                        temp_dq)
 
 

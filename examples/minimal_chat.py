@@ -2,14 +2,11 @@ from exllamav2 import *
 from exllamav2.generator import *
 import sys, torch
 
-config = ExLlamaV2Config()
-config.model_dir = "/mnt/str/models/mixtral-8x7b-instruct-exl2/3.0bpw/"
-config.prepare()
+print("Loading model...")
 
+config = ExLlamaV2Config("/mnt/str/models/mixtral-8x7b-instruct-exl2/3.0bpw/")
 model = ExLlamaV2(config)
 cache = ExLlamaV2Cache(model, lazy = True)
-
-print("Loading model...")
 model.load_autosplit(cache)
 
 tokenizer = ExLlamaV2Tokenizer(config)
@@ -28,12 +25,12 @@ while True:
     context_ids = instruction_ids if generator.sequence_ids is None \
         else torch.cat([generator.sequence_ids, instruction_ids], dim = -1)
 
-    generator.begin_stream(context_ids, gen_settings)
+    generator.begin_stream_ex(context_ids, gen_settings)
 
     while True:
-        chunk, eos, _ = generator.stream()
-        if eos: break
-        print(chunk, end = "")
+        res = generator.stream_ex()
+        if res["eos"]: break
+        print(res["chunk"], end = "")
         sys.stdout.flush()
 
     print()

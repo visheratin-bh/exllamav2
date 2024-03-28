@@ -1,62 +1,70 @@
+from __future__ import annotations
 import torch
 import torch.nn as nn
 from exllamav2.config import ExLlamaV2Config
 from exllamav2.fasttensors import STFile
-from safetensors import safe_open
 
-def _torch_device(idx):
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from exllamav2.model import ExLlamaV2
+
+
+def _torch_device(idx: int) -> str:
     if idx == -1: return "cpu"
     return f"cuda:{idx}"
 
 
-def _tsize(st, key):
-
-    tslice = st.get_slice(key)
-    shape = tslice.get_shape()
-    numel = 1
-    for x in shape: numel *= x
-    dtype = tslice.get_dtype()
-    if dtype == "I32": return numel * 4
-    elif dtype == "I16": return numel * 2
-    elif dtype == "F16": return numel * 2
-    elif dtype == "BF16": return numel * 2
-    elif dtype == "F32": return numel * 4
-    else: raise ValueError(f"Unexpected datatype {dtype}: {key}")
-
-
 class ExLlamaV2Module:
 
-    model = None
     config: ExLlamaV2Config
     key: str
+    alt_key: str | None
     device_idx: int
     footprint: int
+    submodules: list[ExLlamaV2Module]
 
-    def __init__(self, model, key):
+    def __init__(self,
+                 model: ExLlamaV2,
+                 key: str):
 
         self.model = model
         self.key = key
+        self.alt_key = None
         self.footprint = -1
+        self.submodules = []
 
 
-    def numel(self):
+    def numel(self): raise(NotImplementedError())
+    def load(self): raise(NotImplementedError())
+    def unload(self): raise(NotImplementedError())
+    def scratch_space_fixed(self): raise(NotImplementedError())
+    def scratch_space(self): raise(NotImplementedError())
 
-        return 0
+    def forward(self,
+                hidden_states,
+                cache = None,
+                attn_params = None,
+                past_len = None,
+                intermediates = None,
+                loras = None):
+        raise(NotImplementedError())
 
 
-    def device(self):
-
+    def device(self) -> str:
         return _torch_device(self.device_idx)
 
 
-    def load_multi(self, keys, override_key = None, measure = False):
+    def load_multi(self,
+                   key: str,
+                   keys: list[str],
+                   measure: bool = False) -> int | dict[str: torch.Tensor]:
 
         tensors = {}
         submap = {}
         submap_i = {}
         size = 0
 
-        key = self.key if override_key is None else override_key
+        # key = self.key if override_key is None else override_key
 
         for k in keys:
             ck = key + "." + k
@@ -76,84 +84,95 @@ class ExLlamaV2Module:
                 else:
                     tensors[k] = stfile.get_tensor(key + "." + k, device = self.device())
 
-            # with safe_open(v, framework="pt", device="cpu") as st:
-            #     for k in ks:
-            #         if measure:
-            #             size += _tsize(st, key + "." + k)
-            #         else:
-            #             tensors[k] = st.get_tensor(key + "." + k).to(self.device())
-
         return size if measure else tensors
 
 
-    def load_weight(self, override_key = None):
+    def load_weight(self,
+                    override_key: str | None = None):
 
-        key = self.key if override_key is None else override_key
+        if override_key is not None:
+            keys = [override_key]
+        else:
+            keys = [self.key]
+            if self.alt_key is not None:
+                keys += [self.alt_key]
 
-        # EXL2
+        for key in keys:
 
-        if key + ".q_weight" in self.model.config.tensor_file_map:
-            qtensors = self.load_multi(["q_weight", "q_invperm", "q_scale", "q_scale_max", "q_groups", "q_perm"], override_key = override_key)
-            qtensors["q_perm"] = torch.argsort(qtensors["q_invperm"]).to(torch.int)
-            return qtensors
+            # EXL2
 
-        # GPTQ
+            if key + ".q_weight" in self.model.config.tensor_file_map:
+                qtensors = self.load_multi(key, ["q_weight", "q_invperm", "q_scale", "q_scale_max", "q_groups", "q_perm", "bias"])
+                qtensors["q_perm"] = torch.argsort(qtensors["q_invperm"]).to(torch.int)
+                return qtensors
 
-        if key + ".qweight" in self.model.config.tensor_file_map:
-            qtensors = self.load_multi(["qweight", "qzeros", "scales", "g_idx"], override_key = override_key)
-            qtensors["scales"] = qtensors["scales"].half()
-            return qtensors
+            # GPTQ
 
-        # Torch
+            if key + ".qweight" in self.model.config.tensor_file_map:
+                qtensors = self.load_multi(key, ["qweight", "qzeros", "scales", "g_idx", "bias"])
+                if "bias" in qtensors and torch.all(qtensors["bias"].eq(0)):
+                    del qtensors["bias"]
+                qtensors["scales"] = qtensors["scales"].half()
+                return qtensors
 
-        if key + ".weight" in self.model.config.tensor_file_map:
-            if key + ".bias" in self.model.config.tensor_file_map:
-                tensors = self.load_multi(["weight", "bias"], override_key = override_key)
-                tensor = tensors["weight"].half()
-                bias = tensors["bias"].half()
-                return nn.Parameter(tensor), nn.Parameter(bias)
-            else:
-                tensors = self.load_multi(["weight"], override_key = override_key)
-                tensor = tensors["weight"].half()
-                return nn.Parameter(tensor)
+            # Torch
 
-        # No weights found for key
+            if key + ".weight" in self.model.config.tensor_file_map:
+                if key + ".bias" in self.model.config.tensor_file_map:
+                    tensors = self.load_multi(key, ["weight", "bias"])
+                    tensor = tensors["weight"].half()
+                    bias = tensors["bias"].half()
+                    return nn.Parameter(tensor), nn.Parameter(bias)
+                else:
+                    tensors = self.load_multi(key, ["weight"])
+                    tensor = tensors["weight"].half()
+                    return nn.Parameter(tensor)
+
+            # No weights found for key
 
         return None
 
 
-    def weight_footprint(self):
+    def weight_footprint(self) -> int:
 
         if self.footprint == -1:
 
-            # EXL2
+            keys = [self.key]
+            if self.alt_key is not None:
+                keys += [self.alt_key]
 
-            if self.key + ".q_weight" in self.model.config.tensor_file_map:
-                self.footprint = self.load_multi(["q_weight", "q_invperm", "q_scale", "q_scale_max", "q_groups", "q_perm", "q_perm"], measure = True)
+            for key in keys:
 
-            # GPTQ
+                # EXL2
 
-            elif self.key + ".qweight" in self.model.config.tensor_file_map:
-                self.footprint = self.load_multi(["qweight", "qzeros", "scales", "g_idx"], measure = True)
+                if key + ".q_weight" in self.model.config.tensor_file_map:
+                    self.footprint = self.load_multi(key, ["q_weight", "q_invperm", "q_scale", "q_scale_max", "q_groups", "q_perm", "q_perm", "bias"], measure = True)
 
-            # Torch
+                # GPTQ
 
-            elif self.key + ".weight" in self.model.config.tensor_file_map:
-                self.footprint = self.load_multi(["weight"], measure = True)
+                elif key + ".qweight" in self.model.config.tensor_file_map:
+                    self.footprint = self.load_multi(key, ["qweight", "qzeros", "scales", "g_idx", "bias"], measure = True)
+
+                # Torch
+
+                elif key + ".weight" in self.model.config.tensor_file_map:
+                    self.footprint = self.load_multi(key, ["weight", "bias"], measure = True)
+
+                if self.footprint != -1: break
 
             # Error
 
-            else: raise ValueError("Unknown tensor type: " + self.key)
+            if self.footprint == -1:
+                raise ValueError("Unknown tensor type: " + self.key)
 
         return self.footprint
 
 
-    def set_device_idx(self, idx):
-
+    def set_device_idx(self, idx: int):
         self.device_idx = idx
 
 
-    def is_quant(self):
+    def is_quant(self) -> bool:
         return False
 
 

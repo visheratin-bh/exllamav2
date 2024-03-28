@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from exllamav2 import (
     ExLlamaV2,
     ExLlamaV2Cache,
@@ -9,8 +11,8 @@ from exllamav2.generator import (
 )
 import torch
 import random
-
-import torch.nn.functional as F
+import threading
+from exllamav2.generator.hooks import ExLlamaV2PostSamplingHook, ExLlamaV2PostSamplingResult
 
 from typing import Union, List, Tuple
 
@@ -22,14 +24,21 @@ class ExLlamaV2BaseGenerator:
     cache: ExLlamaV2Cache
     tokenizer: ExLlamaV2Tokenizer
 
-    sequence_ids: torch.tensor = None
+    sequence_ids: torch.Tensor | None
 
-    def __init__(self, model, cache, tokenizer):
+    abort_event: threading.Event | None
+
+
+    def __init__(self,
+                 model: ExLlamaV2,
+                 cache: ExLlamaV2Cache,
+                 tokenizer: ExLlamaV2Tokenizer):
 
         self.model = model
         self.cache = cache
         self.tokenizer = tokenizer
-
+        self.sequence_ids = None
+        self.abort_event = None
 
     # For testing purposes, run a forward pass to make sure CUDA is fully initialized
 
@@ -44,18 +53,69 @@ class ExLlamaV2BaseGenerator:
         return self.sequence_ids.shape[-1] >= self.model.config.max_seq_len
 
 
-    # TODO: Argument to allow different random samples over batch dimension
-
-    def generate_simple(self, prompt: str or list,
+    def generate_simple(self,
+                        prompt: str or list,
                         gen_settings: ExLlamaV2Sampler.Settings,
                         num_tokens: int,
-                        seed = None,
-                        token_healing = False,
-                        encode_special_tokens = False,
-                        decode_special_tokens = False,
-                        loras = None,
-                        stop_token = -1,
-                        return_scores = False) -> Union[str, List[str], Tuple[str, torch.tensor], Tuple[List[str], torch.tensor]]:
+                        seed: int or None = None,
+                        token_healing: bool = False,
+                        encode_special_tokens: bool = False,
+                        decode_special_tokens: bool = False,
+                        loras: ExLlamaV2Lora or list[ExLlamaV2Lora] or None = None,
+                        stop_token: int or None = -1,
+                        return_scores = False,
+                        add_bos: bool = False,
+                        abort_event: threading.Event or None = None):
+
+        """
+        Generate one or more completions.
+
+        :param prompt:
+            String or list of strings. If this argument is a list, its length determinse the batch size, and
+            the output will be list of strings as well.
+
+        :param gen_settings:
+            ExLlamaV2Sampler.Settings
+
+        :param num_tokens:
+            Max number of tokens to generate.
+
+        :param seed:
+            Seed for the sampling RNG. Doesn't guarantee perfect determinism from the implementation.
+
+        :param token_healing:
+            Apply token healing by regenerating the last token of the input sequence with prefix
+            constraint.
+
+        :param encode_special_tokens:
+            Encode special tokens (BOS etc.) represented as text in the input. If False, special tokens are
+            interpreted as text by the tokenizer.
+
+        :param decode_special_tokens:
+            Decode special tokens output by the model. If False, tokens marked as special in the tokenizer
+            are decoded as empty strings.
+
+        :param loras:
+            (List of) ExLlamaV2Lora objects to apply during generation
+
+        :param stop_token:
+            ID of the stop token. If this argument is None, no stop token will be considered. The default
+            value is -1, which is interpreted as whatever the EOS token is defined to be in the tokenizer
+            model.
+
+        :param add_bos:
+            Prepend the tokenizer's specified BOS token to the input.
+
+        :param abort_event:
+            Forwarded to the model during generation. Will abort prefill/context ingestion if triggered.
+
+        :return:
+            Completion(s) (str or list[str] depending on the type of the input prompt argument)
+        """
+
+
+        self.abort_event = abort_event
+        if self.abort_event: self.abort_event.clear()
 
         # Default stop token
 
@@ -72,7 +132,10 @@ class ExLlamaV2BaseGenerator:
         # Tokenize input and produce padding mask if needed
 
         batch_size = 1 if isinstance(prompt, str) else len(prompt)
-        ids, position_offsets = self.tokenizer.encode(prompt, encode_special_tokens = encode_special_tokens, return_offsets = True)
+        ids, position_offsets = self.tokenizer.encode(prompt,
+                                                      encode_special_tokens = encode_special_tokens,
+                                                      return_offsets = True,
+                                                      add_bos = add_bos)
         if batch_size == 1: position_offsets = None
 
         overflow = ids.shape[-1] + num_tokens - self.model.config.max_seq_len
@@ -91,6 +154,9 @@ class ExLlamaV2BaseGenerator:
         # Process prompt and begin gen
 
         self._gen_begin_base(ids, mask, loras, position_offsets = position_offsets)
+        if self.abort_event and self.abort_event.is_set():
+            if isinstance(prompt, str): return ""
+            else: return [""] * len(prompt)
 
         # Begin filters
 
@@ -111,10 +177,16 @@ class ExLlamaV2BaseGenerator:
 
         for _ in range(num_tokens):
 
-            logits = self.model.forward(self.sequence_ids[:, -1:], self.cache, input_mask = mask, loras = loras, position_offsets = position_offsets).float().cpu()
-            token, prob, _ = ExLlamaV2Sampler.sample(logits, gen_settings, self.sequence_ids, random.random(), self.tokenizer, prefix_token = unhealed_token)
+            if self.abort_event and self.abort_event.is_set():
+                break
 
-            eos = False
+            logits = self.model.forward(self.sequence_ids[:, -1:],
+                                        self.cache,
+                                        input_mask = mask,
+                                        loras = loras,
+                                        position_offsets = position_offsets).float().cpu()
+            token, ptokens, pprobs, prob, eos = ExLlamaV2Sampler.sample(logits, gen_settings, self.sequence_ids, random.random(), self.tokenizer, prefix_token = unhealed_token)
+
             if stop_token is not None:
                 for b in range(batch_size):
                     if token[b, 0].item() == stop_token:
@@ -127,8 +199,26 @@ class ExLlamaV2BaseGenerator:
             if return_scores:
                 probs = torch.cat([probs, prob], dim=1)
 
+            # Post sampling hook
+
+            if gen_settings.post_sampling_hooks:
+                p = ExLlamaV2PostSamplingResult(
+                    sampled_token = token,
+                    sampled_prob = prob,
+                    logits = logits,
+                    candidate_tokens = None if ptokens.is_meta else ptokens,
+                    candidate_probs = None if pprobs.is_meta else pprobs
+                )
+                for h in gen_settings.post_sampling_hooks:
+                    h(p)
+                token = p.sampled_token
+                if p.feed_filters:
+                    gen_settings.feed_filters(token)
+
+            else:
+                gen_settings.feed_filters(token)
+
             self.sequence_ids = torch.cat([self.sequence_ids, token], dim = 1)
-            gen_settings.feed_filters(token)
 
             unhealed_token = None
             if eos: break
@@ -148,11 +238,21 @@ class ExLlamaV2BaseGenerator:
             return text
 
 
-    def _gen_begin_base(self, input_ids, mask = None, loras = None, position_offsets = None):
+    def _gen_begin_base(self,
+                        input_ids: torch.Tensor,
+                        mask: torch.Tensor | None = None,
+                        loras: ExLlamaV2Lora or list[ExLlamaV2Lora] or None = None,
+                        position_offsets: torch.Tensor | None = None):
 
-        if self.cache is not None:
-            self.cache.current_seq_len = 0
-        self.model.forward(input_ids[:, :-1], self.cache, input_mask = mask, preprocess_only = True, loras = loras, position_offsets = position_offsets)
-
+        self.cache.current_seq_len = 0
         self.sequence_ids = input_ids
 
+        self.model.forward(input_ids[:, :-1],
+                           self.cache,
+                           input_mask = mask,
+                           preprocess_only = True,
+                           loras = loras,
+                           position_offsets = position_offsets,
+                           abort_event = self.abort_event)
+        if self.abort_event and self.abort_event.is_set():
+            self.sequence_ids = self.sequence_ids[:, :self.cache.current_seq_len + 1]

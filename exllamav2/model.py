@@ -1,5 +1,5 @@
-
-import sys
+from __future__ import annotations
+import os, sys
 min_version = (3, 8)
 if sys.version_info < min_version:
     print("")
@@ -7,9 +7,16 @@ if sys.version_info < min_version:
     print("")
 
 # Set CUDA context to lazy loading since we won't need 95% of the modules in Torch
+os.environ["CUDA_MODULE_LOADING"] = "LAZY"
 
-import os
-os.environ['CUDA_MODULE_LOADING']='LAZY'
+# # Set cudaMallocAsync allocator by default as it appears slightly more memory efficient, unless Torch is already
+# # imported in which case changing the allocator would cause it to crash
+# if not "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
+#     try:
+#         x = torch.__version__
+#         # TODO: Should maybe be a warning here?
+#     except NameError:
+#         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
 
 import torch
 import math
@@ -23,11 +30,14 @@ from exllamav2.attn import ExLlamaV2Attention
 from exllamav2.lora import ExLlamaV2Lora
 from exllamav2.mlp import ExLlamaV2MLP
 from exllamav2.moe_mlp import ExLlamaV2MoEMLP
+from exllamav2.parallel_decoder import ExLlamaV2ParallelDecoder
 from exllamav2.embedding import ExLlamaV2Embedding
-# from exllamav2.util import list_live_tensors, print_vram_usage, set_snapshot, diff_snapshot, print_vram_usage_peak
 from exllamav2.compat import safe_move_tensor
 from exllamav2.fasttensors import cleanup_stfiles
+# from exllamav2.util import list_live_tensors, print_vram_usage, set_snapshot, diff_snapshot, print_vram_usage_peak
 import gc
+import threading
+from typing import Callable
 
 def _torch_device(idx):
     if idx == -1: return "cpu"
@@ -36,24 +46,28 @@ def _torch_device(idx):
 
 class ExLlamaV2DeviceTensors:
 
-    model = None
+    model: ExLlamaV2
     device_idx: int
     ready: bool
 
     scratch_bytes: int
     scratch_idx: int
 
-    sin: torch.tensor
-    cos: torch.tensor
+    sin: torch.Tensor | None
+    cos: torch.Tensor | None
 
-    scratch: torch.tensor = None
+    scratch: torch.Tensor | None
 
 
-    def __init__(self, model, device_idx, scratch_bytes):
+    def __init__(self,
+                 model: ExLlamaV2,
+                 device_idx: int,
+                 scratch_bytes: int):
 
         self.model = model
         self.device_idx = device_idx
         self.ready = False
+        self.scratch = None
         self.scratch_bytes = scratch_bytes
         self.scratch_idx = 0
 
@@ -66,6 +80,20 @@ class ExLlamaV2DeviceTensors:
             self.scratch = torch.empty((self.scratch_bytes // 2,), dtype = torch.half, device = _torch_device(self.device_idx))
 
         self.ready = True
+
+
+    def drop(self):
+
+        self.scratch = None
+        self.sin = None
+        self.cos = None
+        self.ready = False
+
+
+    def free(self):
+
+        self.drop()
+        self.scratch_bytes = 1
 
 
     def begin_scratch_alloc(self):
@@ -100,7 +128,10 @@ class ExLlamaV2DeviceTensors:
         if scale != 1.0: t /= scale
 
         freqs = torch.einsum("i,j->ij", t, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
+        if self.model.config.arch.rope_neox_style:
+            emb = torch.cat((freqs, freqs), dim=-1)
+        else:
+            emb = torch.repeat_interleave(freqs, 2, dim=-1)
 
         self.sin = emb.sin()[None, None, :, :].half()
         self.cos = emb.cos()[None, None, :, :].half()
@@ -109,14 +140,13 @@ class ExLlamaV2DeviceTensors:
 class ExLlamaV2:
 
     config: ExLlamaV2Config
-    modules: list = []
-    modules_dict: dict = {}
-    device_tensors: list = []
-    cache_map: dict
+    modules: list[ExLlamaV2Module]
+    modules_dict: dict[str: ExLlamaV2Module]
+    device_tensors: list[ExLlamaV2DeviceTensors]
+    cache_map: dict[int: str]
     last_kv_layer_idx: int
     head_layer_idx: int
     loaded: bool
-
 
     def __init__(self, config: ExLlamaV2Config, lazy_load = False):
 
@@ -129,41 +159,60 @@ class ExLlamaV2:
 
         # Build model
 
-        self.modules.append(ExLlamaV2Embedding(self, "model.embed_tokens"))
-        self.modules_dict[self.modules[-1].key] = self.modules[-1]
+        emb = ExLlamaV2Embedding(self, "model.embed_tokens")
+        self.modules += [emb]
 
         for layer_idx in range(self.config.num_hidden_layers):
 
-            self.modules.append(ExLlamaV2Attention(self, f"model.layers.{layer_idx}", layer_idx))
-            for m in self.modules[-1].submodules: self.modules_dict[m.key] = m
-            if self.config.architecture == "Mixtral":
-                self.modules.append(ExLlamaV2MoEMLP(self, f"model.layers.{layer_idx}", layer_idx))
+            layer_key = f"model.layers.{layer_idx}"
+            if self.config.arch.parallel_decoder_blocks:
+                pd = ExLlamaV2ParallelDecoder(self, layer_key, layer_idx)
+                self.modules += [pd]
             else:
-                self.modules.append(ExLlamaV2MLP(self, f"model.layers.{layer_idx}", layer_idx))
-            for m in self.modules[-1].submodules: self.modules_dict[m.key] = m
+                attn = ExLlamaV2Attention(self, layer_key, layer_idx)
+                if self.config.arch.is_moe: mlp = ExLlamaV2MoEMLP(self, layer_key, layer_idx)
+                else: mlp = ExLlamaV2MLP(self, layer_key, layer_idx)
+                self.modules += [attn, mlp]
 
-        if self.config.architecture == "Orion":
-            self.modules.append(ExLlamaV2LayerNorm(self, "model.norm"))
-        else:
-            self.modules.append(ExLlamaV2RMSNorm(self, "model.norm"))
-        self.modules_dict[self.modules[-1].key] = self.modules[-1]
+        if self.config.arch.norm == "layernorm": norm = ExLlamaV2LayerNorm(self, "model.norm")
+        elif self.config.arch.norm == "rmsnorm": norm = ExLlamaV2RMSNorm(self, "model.norm")
+        else: raise ValueError("unknown norm type")
+        self.modules += [norm]
 
         self.head_layer_idx = len(self.modules)
-        self.modules.append(ExLlamaV2Linear(self, "lm_head", self.config.hidden_size, self.config.vocab_size, False))
-        self.modules_dict[self.modules[-1].key] = self.modules[-1]
+        head = ExLlamaV2Linear(self, "lm_head",
+                               self.config.hidden_size,
+                               self.config.vocab_size,
+                               False,
+                               max_out_len = self.config.max_output_len,
+                               prescale = self.config.logit_scale)
+        if self.config.arch.lm_head_key != "lm_head":
+            head.alt_key = self.config.arch.lm_head_key
+        self.modules += [head]
+
+        # Compile dictionary of modules
+
+        for module in self.modules:
+            if len(module.submodules) > 0:
+                for m in module.submodules: self.modules_dict[m.key] = m
+            else:
+                self.modules_dict[module.key] = module
 
         # Find last layer that affects k/v cache
 
         layer_idx = len(self.modules)
         while True:
             layer_idx -= 1
-            if isinstance(self.modules[layer_idx], ExLlamaV2Attention):
+            if isinstance(self.modules[layer_idx], ExLlamaV2Attention) or \
+               isinstance(self.modules[layer_idx], ExLlamaV2ParallelDecoder):
                 break
 
         self.last_kv_layer_idx = layer_idx
 
 
-    def set_device_map(self, allocation, embed_cpu = True):
+    def set_device_map(self,
+                       allocation: list[float],
+                       embed_cpu: bool = True) -> list[float]:
 
         self.cache_map = {}
 
@@ -173,7 +222,6 @@ class ExLlamaV2:
         constant_size = sincos_size * 2
 
         # Max size of hidden state
-        # TODO: Option to reserve space for cache while loading model
 
         state_size = self.config.hidden_size * self.config.max_input_len * self.config.max_batch_size * 2
         mask_size = self.config.max_input_len ** 2 * self.config.max_batch_size * 2
@@ -243,12 +291,23 @@ class ExLlamaV2:
         return [(ab - rb - rba) / 1024**3 for (ab, rb, rba) in zip(allocation_bytes, reserve_bytes, reserve_bytes_attn)]
 
 
-    def load(self, gpu_split = None, lazy = False, stats = False, callback = None, callback_gen = None):
+    def load(self,
+             gpu_split: list[float] | None = None,
+             lazy: bool = False,
+             stats: bool = False,
+             callback: Callable[[int, int], None] | None = None,
+             callback_gen: Callable[[int, int], None] | None = None):
+
         f = self.load_gen(gpu_split, lazy, stats, callback, callback_gen)
-        for item in f: return item
+        for item in f: x = item
 
 
-    def load_gen(self, gpu_split = None, lazy = False, stats = False, callback = None, callback_gen = None):
+    def load_gen(self,
+                 gpu_split: list[float] | None = None,
+                 lazy: bool = False,
+                 stats: bool = False,
+                 callback: Callable[[int, int], None] | None = None,
+                 callback_gen: Callable[[int, int], None] | None = None):
 
         with torch.inference_mode():
 
@@ -275,15 +334,26 @@ class ExLlamaV2:
             self.loaded = True
             cleanup_stfiles()
 
-            if stats: yield gpu_split, stats_
-            else: yield gpu_split
+            # if stats: yield gpu_split, stats_
+            # else: yield gpu_split
 
 
-    def load_autosplit(self, cache, reserve_vram = None, last_id_only = False, callback = None, callback_gen = None):
+    def load_autosplit(self,
+                       cache: ExLlamaV2CacheBase,
+                       reserve_vram: int | None = None,
+                       last_id_only: bool = False,
+                       callback: Callable[[int, int], None] | None = None,
+                       callback_gen: Callable[[int, int], None] | None = None):
+
         f = self.load_autosplit_gen(cache, reserve_vram, last_id_only, callback, callback_gen)
         for item in f: x = item
 
-    def load_autosplit_gen(self, cache, reserve_vram = None, last_id_only = False, callback = None, callback_gen = None):
+    def load_autosplit_gen(self,
+                           cache: ExLlamaV2CacheBase,
+                           reserve_vram: int | None = None,
+                           last_id_only: bool = False,
+                           callback: Callable[[int, int], None] | None = None,
+                           callback_gen: Callable[[int, int], None] | None = None):
 
         # Limit model's max_input_len to max_seq_len if necessary
         self.config.max_input_len = min(self.config.max_input_len, self.config.max_seq_len)
@@ -315,9 +385,7 @@ class ExLlamaV2:
 
             # Size of fixed scratch space
 
-            scratch_fixed = 0
-            for module in self.modules:
-                scratch_fixed = max(scratch_fixed, module.scratch_space_fixed())
+            scratch_fixed = max(module.scratch_space_fixed() for module in self.modules)
 
             # Load modules and create cache tensors sequentially
 
@@ -362,7 +430,8 @@ class ExLlamaV2:
                     hidden_state_backup = safe_move_tensor(hidden_state, "cpu").clone()
 
                     try:
-                        if isinstance(module, ExLlamaV2Attention):
+                        if isinstance(module, ExLlamaV2Attention) or \
+                           isinstance(module, ExLlamaV2ParallelDecoder):
                             self.cache_map[module.layer_idx] = module.device()
                             cache.update_cache_tensors()
 
@@ -371,6 +440,8 @@ class ExLlamaV2:
                         if idx == self.head_layer_idx:
                             if last_id_only:
                                 hidden_state = hidden_state.narrow(-2, -1, 1)
+                            elif self.config.max_output_len is not None:
+                                hidden_state = hidden_state.narrow(-2, -self.config.max_output_len, self.config.max_output_len)
 
                         hidden_state = safe_move_tensor(hidden_state, _torch_device(current_device))
                         hidden_state = module.forward(hidden_state, cache = cache, attn_params = attn_params, past_len = past_len, loras = loras)
@@ -379,7 +450,9 @@ class ExLlamaV2:
                     except Exception as e:
 
                         test = 0
-                        if ("CUDA out of memory" in str(e)) or ("HIP out of memory" in str(e)):
+                        if e.__class__.__name__ == "OutOfMemoryError" or \
+                            "CUDA out of memory" in str(e) or \
+                            "HIP out of memory" in str(e):
                             fail = True  # Exception object will hold references to tensors so we can't free them here
                         else:
                             raise
@@ -435,20 +508,34 @@ class ExLlamaV2:
     def set_cache_map(self):
 
         for module in self.modules:
-            if isinstance(module, ExLlamaV2Attention): self.cache_map[module.layer_idx] = module.device()
+            if isinstance(module, ExLlamaV2Attention) or \
+               isinstance(module, ExLlamaV2ParallelDecoder):
+                self.cache_map[module.layer_idx] = module.device()
 
 
-    def get_cache_devices(self):
+    def get_cache_devices(self) -> list[str]:
 
         return list(set(self.cache_map.values()))
 
 
     def create_device_tensors(self, scratch_bytes):
 
-        for idx, bytes in enumerate(scratch_bytes):
+        for idx, b in enumerate(scratch_bytes):
 
-            tensors = ExLlamaV2DeviceTensors(self, idx, bytes)
+            tensors = ExLlamaV2DeviceTensors(self, idx, b)
             self.device_tensors.append(tensors)
+
+
+    def drop_device_tensors(self):
+
+        for dt in self.device_tensors:
+            dt.drop()
+
+
+    def free_device_tensors(self):
+
+        for dt in self.device_tensors:
+            dt.free()
 
 
     def get_device_tensors(self, device_idx, scratch = True):
@@ -458,9 +545,9 @@ class ExLlamaV2:
         return tensors
 
 
-    def get_modules(self):
+    def get_modules(self) -> list[ExLlamaV2Module]:
 
-        return [module for module in self.modules]
+        return [module for module in self.modules]  #?
 
 
     def update_loras(self):
@@ -471,7 +558,7 @@ class ExLlamaV2:
             if isinstance(module, ExLlamaV2MoEMLP): module.update_loras()
 
 
-    def is_quant(self):
+    def is_quant(self) -> bool:
 
         for module in self.modules:
             if isinstance(module, ExLlamaV2Attention):
@@ -482,18 +569,57 @@ class ExLlamaV2:
 
     @torch.inference_mode()
     def forward(self,
-                input_ids,
-                cache = None,
-                input_mask = None,
-                preprocess_only = False,
-                last_id_only = False,
-                loras = None,
-                return_last_state = False,
-                position_offsets = None):
+                input_ids: torch.Tensor,
+                cache: ExLlamaV2CacheBase | list[ExLlamaV2CacheBase] | None = None,
+                input_mask: torch.Tensor | None = None,
+                preprocess_only: bool = False,
+                last_id_only: bool = False,
+                loras: list[ExLlamaV2Lora] | None = None,
+                return_last_state: bool = False,
+                position_offsets: torch.Tensor | None = None,
+                abort_event: threading.Event | None = None) \
+        -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+        """
+        Runs a forward pass through the model. If a cache is used, also appends keys/values to the cache
+        and advances it.
 
-        q_len = input_ids.shape[-1]
+        :param input_ids:
+            LongTensor of input token IDs, shape (batch_size, q_len)
+
+        :param cache:
+            Optional ExLlamaV2Cache. If not provided, q_len must be less than config.max_input_len
+
+        :param input_mask:
+            Additive attention bias, shape (batch_size, past_len + q_len, q_len)
+
+        :param preprocess_only:
+            Only forward up to the last layer that affects the K/V cache. Does not return logits. Used
+            to prefill the cache.
+
+        :param last_id_only:
+            Process the entire input sequence but only pass the last token through the head layer and
+            only return logits for the last token.
+
+        :param loras:
+            List of ExLlamaV2Lora objects to apply during the forward pass
+
+        :param return_last_state:
+            Also return the hidden state right before the head layer
+
+        :param position_offsets:
+            Tensor of position offsets, shape (batch_size, 1). Offset is applied to position IDs during
+            RoPE application.
+
+        :param abort_event:
+            Optional event that, if set, will abort the forward pass. Function will return None if aborted.
+
+        :return:
+            FP16 logits tensor, shape (batch_size, q_len, vocab_size)
+            (optional) state tensor, shape (batch_size, q_len, hidden_size)
+        """
+
+        bsz, q_len = input_ids.shape
         remaining_q_len = q_len
-        bsz = input_ids.shape[0]
 
         # Attn and MLP layers have preallocated buffers for temp states, sized by the model config. Effective max input
         # length depends on the current batch size
@@ -514,7 +640,10 @@ class ExLlamaV2:
                                                last_id_only = last_id_only,
                                                loras = loras,
                                                return_last_state = return_last_state,
-                                               position_offsets = position_offsets)
+                                               position_offsets = position_offsets,
+                                               abort_event = abort_event)
+
+            if abort_event and abort_event.is_set(): return
 
             if last_state is None:
                 return result
@@ -563,7 +692,10 @@ class ExLlamaV2:
                                   last_id_only = _last_id_only,
                                   loras = loras,
                                   return_last_state = return_last_state and remaining_q_len <= chunk_size,
-                                  position_offsets = position_offsets)
+                                  position_offsets = position_offsets,
+                                  abort_event = abort_event)
+
+            if abort_event and abort_event.is_set(): return
 
             if not _preprocess_only:
                 result = r if result is None else torch.cat((result, r), dim = 1)
@@ -581,14 +713,16 @@ class ExLlamaV2:
 
     @torch.inference_mode()
     def _forward(self,
-                 input_ids,
-                 cache = None,
-                 input_mask = None,
-                 preprocess_only = False,
-                 last_id_only = False,
-                 loras = None,
-                 return_last_state = False,
-                 position_offsets = None):
+                 input_ids: torch.Tensor,
+                 cache: ExLlamaV2CacheBase | list[ExLlamaV2CacheBase] | None = None,
+                 input_mask: torch.Tensor | None = None,
+                 preprocess_only: bool = False,
+                 last_id_only: bool = False,
+                 loras: list[ExLlamaV2Lora] | None = None,
+                 return_last_state: bool = False,
+                 position_offsets: torch.Tensor | None = None,
+                 abort_event: threading.Event | None = None) \
+        -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
 
         batch_size, seq_len = input_ids.shape
         past_len = 0
@@ -598,6 +732,12 @@ class ExLlamaV2:
             else:
                 past_len = [c.current_seq_len for c in cache]
 
+        assert self.config.max_output_len is None or \
+            preprocess_only or \
+            last_id_only or \
+            seq_len <= self.config.max_output_len, \
+            "seq_len exceeds max_output_len"
+
         # assert cache is None or isinstance(cache, list) or batch_size <= cache.batch_size
 
         x = input_ids
@@ -606,9 +746,13 @@ class ExLlamaV2:
 
         for idx, module in enumerate(self.modules):
 
-            device = _torch_device(module.device_idx)
+            # Respect abort signal
+
+            if abort_event and abort_event.is_set(): return None, None
 
             # Onward
+
+            device = _torch_device(module.device_idx)
 
             if idx == self.head_layer_idx:
                 if last_id_only and return_last_state:
@@ -633,6 +777,11 @@ class ExLlamaV2:
                 for c in cache: c.current_seq_len += seq_len
             else:
                 cache.current_seq_len += seq_len
+
+        # Apply logit scale
+
+        # if x is not None and self.config.logit_scale != 1:
+        #     x.mul_(self.config.logit_scale)
 
         # Set padding logits to -inf
 

@@ -11,7 +11,7 @@ precompile = 'EXLLAMA_NOCOMPILE' not in os.environ
 
 windows = (os.name == "nt")
 
-extra_cflags = ["/Ox"] if windows else ["-O3"]
+extra_cflags = ["/Ox", "/arch:AVX2"] if windows else ["-O3", "-mavx2"]
 
 if ext_debug:
     extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
@@ -31,7 +31,18 @@ setup_kwargs = {
         cpp_extension.CUDAExtension(
             extension_name,
             [
-                "exllamav2/exllamav2_ext/ext.cpp",
+                "exllamav2/exllamav2_ext/ext_bindings.cpp",
+                "exllamav2/exllamav2_ext/ext_cache.cpp",
+                "exllamav2/exllamav2_ext/ext_gemm.cpp",
+                "exllamav2/exllamav2_ext/ext_norm.cpp",
+                "exllamav2/exllamav2_ext/ext_qattn.cpp",
+                "exllamav2/exllamav2_ext/ext_qmatrix.cpp",
+                "exllamav2/exllamav2_ext/ext_qmlp.cpp",
+                "exllamav2/exllamav2_ext/ext_quant.cpp",
+                "exllamav2/exllamav2_ext/ext_rope.cpp",
+                "exllamav2/exllamav2_ext/ext_safetensors.cpp",
+                "exllamav2/exllamav2_ext/ext_sampling.cpp",
+                "exllamav2/exllamav2_ext/cuda/h_add.cu",
                 "exllamav2/exllamav2_ext/cuda/h_gemm.cu",
                 "exllamav2/exllamav2_ext/cuda/lora.cu",
                 "exllamav2/exllamav2_ext/cuda/pack_tensor.cu",
@@ -93,12 +104,13 @@ setup(
         "pandas",
         "ninja",
         "fastparquet",
-        "torch>=2.0.1",
+        "torch>=2.2.0",
         "safetensors>=0.3.2",
         "sentencepiece>=0.1.97",
         "pygments",
         "websockets",
-        "regex"
+        "regex",
+        "numpy"
     ],
     include_package_data = True,
     verbose = verbose,

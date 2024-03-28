@@ -34,6 +34,9 @@ public:
     std::unordered_map<uintptr_t, std::tuple<half*, half*, int>> up_proj_lora;
     std::unordered_map<uintptr_t, std::tuple<half*, half*, int>> down_proj_lora;
 
+    bool act_gelu;
+    bool has_residual;
+
     QMLP
     (
         half* _layernorm,
@@ -47,7 +50,9 @@ public:
         half* _temp_a,
         half* _temp_b,
         half* _temp_dq,
-        int _max_rows
+        int _max_rows,
+        bool _act_gelu,
+        bool _has_residual
     );
 
     ~QMLP();
@@ -94,6 +99,8 @@ public:
     int max_rows;
     int hidden_dim;
 
+    bool act_gelu;
+
 //    std::vector<std::unordered_map<uintptr_t, std::tuple<half*, half*, int>>> w1_lora;
 //    std::vector<std::unordered_map<uintptr_t, std::tuple<half*, half*, int>>> w2_lora;
 //    std::vector<std::unordered_map<uintptr_t, std::tuple<half*, half*, int>>> w3_lora;
@@ -117,7 +124,8 @@ public:
         half* _temp_logits,
         half* _temp_dq,
         int _max_rows,
-        int _hidden_dim
+        int _hidden_dim,
+        bool _act_gelu
     );
 
     ~QMoEMLP();

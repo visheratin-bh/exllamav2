@@ -4,6 +4,7 @@ from exllamav2 import(
     ExLlamaV2Config,
     ExLlamaV2Cache,
     ExLlamaV2Cache_8bit,
+    ExLlamaV2Cache_Q4,
     ExLlamaV2Tokenizer,
     model_init,
 )
@@ -16,9 +17,9 @@ from exllamav2.generator import (
 from exllamav2.attn import ExLlamaV2Attention
 from exllamav2.mlp import ExLlamaV2MLP
 from exllamav2.moe_mlp import ExLlamaV2MoEMLP
+from exllamav2.parallel_decoder import ExLlamaV2ParallelDecoder
 
 import argparse, os, math, time
-import pandas, fastparquet
 import torch
 import torch.nn.functional as F
 from conversion.tokenize import get_tokens
@@ -36,13 +37,17 @@ torch.set_printoptions(precision = 10)
 # torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 # torch.set_float32_matmul_precision("medium")
 
+# (!!!) NOTE: These go on top of the engine arguments that can be found in `model_init.py` (!!!)
 parser = argparse.ArgumentParser(description = "Test inference on ExLlamaV2 model")
 parser.add_argument("-ed", "--eval_dataset", type = str, help = "Perplexity evaluation dataset (.parquet file)")
 parser.add_argument("-er", "--eval_rows", type = int, default = 128, help = "Number of rows to apply from dataset")
 parser.add_argument("-el", "--eval_length", type = int, default = 2048, help = "Max no. tokens per sample")
 parser.add_argument("-et", "--eval_token", action = "store_true", help = "Evaluate perplexity on token-by-token inference using cache")
-parser.add_argument("-e8", "--eval_token_8bit", action = "store_true", help = "Evaluate perplexity on token-by-token inference using 8-bit cache")
+parser.add_argument("-e8", "--eval_token_8bit", action = "store_true", help = "Evaluate perplexity on token-by-token inference using 8-bit (FP8) cache")
+parser.add_argument("-eq4", "--eval_token_q4", action = "store_true", help = "Evaluate perplexity on token-by-token inference using Q4 cache")
+# parser.add_argument("-eb", "--eval_bos", action = "store_true", help = "Add BOS token to every row in perplexity test (required by Gemma and maybe other models.)")
 parser.add_argument("-p", "--prompt", type = str, help = "Generate from prompt (basic sampling settings)")
+parser.add_argument("-pnb", "--prompt_no_bos", action = "store_true", help = "Don't add BOS token to prompt")
 parser.add_argument("-t", "--tokens", type = int, default = 128, help = "Max no. tokens")
 parser.add_argument("-ps", "--prompt_speed", action = "store_true", help = "Test prompt processing (batch) speed over context length")
 parser.add_argument("-s", "--speed", action = "store_true", help = "Test raw generation speed over context length")
@@ -60,7 +65,7 @@ args = parser.parse_args()
 # Check conflicting settings
 
 if args.stream_layers:
-    if args.eval_token or args.eval_token_8bit:
+    if args.eval_token or args.eval_token_8bit or args.eval_token_q4:
         print(" ## Can't test token ppl while streaming layers")
         sys.exit()
     if args.prompt:
@@ -120,6 +125,7 @@ if args.rank_reduce:
         while True:
             idx -= 1
             module = model.modules[idx]
+            if isinstance(module, ExLlamaV2ParallelDecoder): break
             if isinstance(module, ExLlamaV2MLP): break
             if isinstance(module, ExLlamaV2MoEMLP): break
             if idx < 0:
@@ -187,7 +193,7 @@ if args.prompt:
 
         time_begin = time.time()
 
-        output = generator.generate_simple(args.prompt, settings, args.tokens, token_healing = True)
+        output = generator.generate_simple(args.prompt, settings, args.tokens, token_healing = True, add_bos = not args.prompt_no_bos)
 
         torch.cuda.synchronize()
         time_prompt = time.time()
@@ -257,6 +263,11 @@ if args.eval_dataset or args.standard_perplexity:
             eval_tokens = get_tokens(eval_rows, eval_length, eval_dataset, tokenizer)
             eval_len = [eval_tokens.shape[1]] * eval_tokens.shape[0]
 
+            # if args.eval_bos:
+            if model.config.arch.requires_bos:
+                boss = torch.full((eval_tokens.shape[0], 1), tokenizer.bos_token_id, dtype = torch.long)
+                eval_tokens = torch.cat((boss, eval_tokens[:, :-1]), dim = 1)
+
         logprob_sum = 0.0
         logprob_count = 0
 
@@ -325,6 +336,9 @@ if args.eval_dataset or args.standard_perplexity:
                     else:
                         input_ids = eval_tokens[a:b, :]
                         logits = x[:, :-1, :]
+
+                        # if model.config.logit_scale != 1:
+                        #     logits.mul_(model.config.logit_scale)
 
                         logprob_sum__, logprob_count__ = ppl(input_ids, logits, eval_len[a:b])
                         logprob_sum += logprob_sum__
@@ -416,6 +430,15 @@ if args.eval_dataset or args.standard_perplexity:
                 print(f" -- Inference (token, 8-bit cache)", end = "")
                 sys.stdout.flush()
                 cache = ExLlamaV2Cache_8bit(model, max_seq_len = eval_length)
+                test_ppl_token()
+
+        if args.eval_token_q4:
+            if args.standard_perplexity:
+                print(f" !! Note, can't evalutate token perplexity on standard test")
+            else:
+                print(f" -- Inference (token, Q4 cache)", end = "")
+                sys.stdout.flush()
+                cache = ExLlamaV2Cache_Q4(model, max_seq_len = eval_length)
                 test_ppl_token()
 
 
