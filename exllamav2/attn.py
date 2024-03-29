@@ -355,6 +355,8 @@ class ExLlamaV2Attention(ExLlamaV2Module):
 
 
     def temp_attn_size(self):
+        global has_flash_attn
+
         att_max = min(self.model.config.max_attention_size, self.model.config.max_seq_len ** 2)
 
         if has_flash_attn and not self.model.config.no_flash_attn:
